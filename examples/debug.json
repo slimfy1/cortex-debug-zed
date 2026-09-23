@@ -1,0 +1,37 @@
+// Put this file into your firmware project as .zed/debug.json
+// Paths are relative to "cwd", which defaults to the project root.
+[
+  {
+    "label": "J-Link: flash & debug",
+    "adapter": "cortex-debug",
+    "request": "launch",
+    "servertype": "jlink",
+    "device": "STM32F407VG",          // J-Link device name
+    "interface": "swd",
+    "executable": "build/firmware.elf",
+    "runToEntryPoint": "main",
+
+    // Optional: only needed if the tools are not on PATH / not auto-detected
+    // "serverpath": "C:/Program Files/SEGGER/JLink/JLinkGDBServerCL.exe",
+    // "armToolchainPath": "C:/Program Files (x86)/Arm GNU Toolchain arm-none-eabi/14.2 rel1/bin",
+    // "gdbPath": "C:/path/to/arm-none-eabi-gdb.exe",
+
+    // Optional: gdb-server output -> "console" (default), "none" or a log file path
+    // "gdbServerOutput": "build/jlink-gdbserver.log",
+
+    // Optional: RTT; the TCP port to connect to is printed in the debug console
+    // "rttConfig": { "enabled": true, "address": "auto", "decoders": [{ "port": 0, "type": "console" }] },
+
+    // Optional: build before debugging (any Zed task / command)
+    // "build": { "command": "cmake", "args": ["--build", "build"] }
+  },
+  {
+    "label": "J-Link: attach (no flashing)",
+    "adapter": "cortex-debug",
+    "request": "attach",
+    "servertype": "jlink",
+    "device": "STM32F407VG",
+    "interface": "swd",
+    "executable": "build/firmware.elf"
+  }
+]

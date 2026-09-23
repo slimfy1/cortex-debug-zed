@@ -1,0 +1,699 @@
+From a70563242fdb8f962c80030d249bedac1e93d359 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 23 Sep 2026 22:29:04 +0300
+Subject: [PATCH] Add headless adapter entry point for the Zed editor
+
+- src/zed/adapter.ts: resolves debug.json configs without the VS Code
+  frontend and replaces the gdb-server console with DAP output events
+- split the stock adapter entry into src/debugadapter-main.ts so gdb.ts
+  can be imported without side effects
+- mi2: don't treat a digits-only partial read (MI token) as console output;
+  gdb 15 flushes the token separately which hung session start
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UStNUDdj88B9YWgFcwipyi
+---
+ src/backend/mi2/mi2.ts   |   7 +
+ src/debugadapter-main.ts |  14 +
+ src/gdb.ts               |   7 -
+ src/zed/adapter.ts       | 586 +++++++++++++++++++++++++++++++++++++++
+ webpack.config.js        |  12 +-
+ 5 files changed, 617 insertions(+), 9 deletions(-)
+ create mode 100644 src/debugadapter-main.ts
+ create mode 100644 src/zed/adapter.ts
+
+diff --git a/src/backend/mi2/mi2.ts b/src/backend/mi2/mi2.ts
+index e750f9a..689f2fc 100644
+--- a/src/backend/mi2/mi2.ts
++++ b/src/backend/mi2/mi2.ts
+@@ -264,6 +264,13 @@ export class MI2 extends EventEmitter implements IBackend {
+     }
+ 
+     private onOutputPartial(line) {
++        // A partial line made only of digits is the token prefix of an MI record
++        // (e.g. "5" of "5^done") that gdb flushed separately; wait for the rest of it.
++        // Newer gdb versions (seen with gdb 15) do this, and treating it as console
++        // output loses the token and hangs the session.
++        if (/^\d+$/.test(line)) {
++            return false;
++        }
+         if (couldBeOutput(line)) {
+             this.logNoNewLine('stdout', line);
+             return true;
+diff --git a/src/debugadapter-main.ts b/src/debugadapter-main.ts
+new file mode 100644
+index 0000000..be2ad84
+--- /dev/null
++++ b/src/debugadapter-main.ts
+@@ -0,0 +1,14 @@
++// Entry point of the stock (VS Code) debug adapter. Kept separate from gdb.ts so that
++// other front-ends (e.g. the Zed shim in src/zed/adapter.ts) can import GDBDebugSession
++// without starting a session as a side effect.
++import { LoggingDebugSession } from '@vscode/debugadapter';
++import { GDBDebugSession } from './gdb';
++import { ServerConsoleLog } from './backend/server';
++
++try {
++    LoggingDebugSession.run(GDBDebugSession);
++} catch (error) {
++    console.error('cortex-debug: Error occurred while running GDBDebugSession:', error);
++    ServerConsoleLog('cortex-debug: Caught exception: ' + error.toString());
++    throw error;
++}
+diff --git a/src/gdb.ts b/src/gdb.ts
+index 5a06b57..f8f49f0 100755
+--- a/src/gdb.ts
++++ b/src/gdb.ts
+@@ -3654,10 +3654,3 @@ process.on('unhandledRejection', (reason, promise) => {
+     ServerConsoleLog(msg);
+ });
+ 
+-try {
+-    LoggingDebugSession.run(GDBDebugSession);
+-} catch (error) {
+-    console.error('cortex-debug: Error occurred while running GDBDebugSession:', error);
+-    ServerConsoleLog('cortex-debug: Caught exception: ' + error.toString());
+-    throw error;
+-}
+diff --git a/src/zed/adapter.ts b/src/zed/adapter.ts
+new file mode 100644
+index 0000000..e74a5a3
+--- /dev/null
++++ b/src/zed/adapter.ts
+@@ -0,0 +1,586 @@
++/*
++ * Cortex-Debug adapter entry point for the Zed editor.
++ *
++ * In VS Code, the Cortex-Debug *frontend* (src/frontend/*) does two jobs before the
++ * debug adapter (src/gdb.ts) ever sees a launch request:
++ *   1. It "resolves" launch.json: fills in defaults, normalises paths, validates
++ *      the gdb-server specific options (CortexDebugConfigurationProvider).
++ *   2. It hosts a TCP server ("gdb-server console") that the adapter pipes the
++ *      gdb-server's stdout/stderr into, shown in the TERMINAL tab.
++ *
++ * Zed talks to the adapter directly over DAP, so this file re-implements both jobs
++ * headlessly and then hands over to the unchanged GDBDebugSession:
++ *   - config resolution is a port of configprovider.ts without any `vscode` API;
++ *   - the gdb-server console is a local TCP server whose output is forwarded to
++ *     Zed's debug console as DAP `output` events (or to a file / nowhere).
++ *
++ * VS Code-only UI features (SVD/peripheral view, RTOS view, memory view, graphs,
++ * live watch panel, SWO/RTT terminals) are not available; RTT/SWO data can still
++ * be read from the TCP ports printed at session start.
++ */
++
++import * as fs from 'fs';
++import * as net from 'net';
++import * as os from 'os';
++import * as path from 'path';
++import { LoggingDebugSession, OutputEvent } from '@vscode/debugadapter';
++import { DebugProtocol } from '@vscode/debugprotocol';
++import { GDBDebugSession } from '../gdb';
++import { ServerConsoleLog } from '../backend/server';
++import { ADAPTER_DEBUG_MODE, ConfigurationArguments, defSymbolFile, sanitizeDevDebug, SymbolFile, validateELFHeader } from '../common';
++
++// Version of this Zed port; bump together with zed-extension/extension.toml
++const ZED_ADAPTER_VERSION = '0.1.0';
++
++// Directory that contains `dist/` and `support/` (gdbsupport.init etc.)
++// The bundle lives at <root>/dist/zedadapter.js
++const PACKAGE_ROOT = path.resolve(__dirname, '..');
++
++const OPENOCD_VALID_RTOS: string[] = [
++    'auto', 'FreeRTOS', 'ThreadX', 'chibios', 'Chromium-EC', 'eCos', 'embKernel',
++    'linux', 'mqx', 'nuttx', 'RIOT', 'uCOS-III', 'Zephyr'
++];
++const JLINK_VALID_RTOS: string[] = ['Azure', 'ChibiOS', 'embOS', 'FreeRTOS', 'NuttX', 'Zephyr'];
++
++type Warn = (msg: string) => void;
++
++// ---------------------------------------------------------------------------
++// Config resolution (port of src/frontend/configprovider.ts, minus VS Code APIs)
++// ---------------------------------------------------------------------------
++
++function defaultLibExt(): string {
++    switch (os.platform()) {
++        case 'darwin': return '.dylib';
++        case 'win32': return '.dll';
++        default: return '.so';
++    }
++}
++
++/** Look for the SEGGER J-Link GDB server in its usual install locations */
++function findJLinkGDBServer(): string | undefined {
++    const candidates: string[] = [];
++    if (os.platform() === 'win32') {
++        const exe = 'JLinkGDBServerCL.exe';
++        const roots = [process.env['ProgramFiles'], process.env['ProgramFiles(x86)'], 'C:\\Program Files', 'C:\\Program Files (x86)']
++            .filter((r): r is string => !!r);
++        for (const root of Array.from(new Set(roots))) {
++            const segger = path.join(root, 'SEGGER');
++            let entries: string[] = [];
++            try {
++                entries = fs.readdirSync(segger);
++            } catch {
++                continue;
++            }
++            // "JLink" (newer installers) first, then "JLink_V812" style, newest first
++            entries = entries.filter((e) => /^JLink/i.test(e)).sort((a, b) => {
++                if (a.toLowerCase() === 'jlink') { return -1; }
++                if (b.toLowerCase() === 'jlink') { return 1; }
++                return b.localeCompare(a, undefined, { numeric: true });
++            });
++            for (const e of entries) {
++                candidates.push(path.join(segger, e, exe));
++            }
++        }
++    } else if (os.platform() === 'darwin') {
++        candidates.push('/Applications/SEGGER/JLink/JLinkGDBServerCLExe', '/usr/local/bin/JLinkGDBServerCLExe');
++    } else {
++        candidates.push('/opt/SEGGER/JLink/JLinkGDBServerCLExe', '/usr/bin/JLinkGDBServerCLExe');
++    }
++    return candidates.find((c) => {
++        try {
++            return fs.statSync(c).isFile();
++        } catch {
++            return false;
++        }
++    });
++}
++
++function adjustStrIntProp(obj: any, prop: string, where: string, warn: Warn) {
++    if (!(prop in obj)) {
++        return;
++    }
++    let val: any = obj[prop];
++    if (val) {
++        let isIntString = false;
++        if (typeof val === 'string') {
++            val = val.trim();
++            isIntString = !!(val.match(/^0[x][0-9a-f]+/i) || val.match(/^[0-9]+/));
++        }
++        if (isIntString) {
++            obj[prop] = parseInt(val);
++        } else if (typeof obj[prop] !== 'number') {
++            warn(`Invalid "${prop}" value ${val} for ${where}. Must be a number or a string. Use a string starting with "0x" for a hexadecimal number`);
++            delete obj[prop];
++        }
++    }
++}
++
++function validateLoadAndSymbolFiles(config: any, cwd: string, warn: Warn) {
++    if (config.executable) {
++        let exe = config.executable;
++        exe = path.isAbsolute(exe) ? exe : path.join(cwd || '.', exe);
++        config.executable = path.normalize(exe).replace(/\\/g, '/');
++    }
++    const def = defSymbolFile(config.executable);
++    const symFiles: SymbolFile[] = config.symbolFiles?.map((v: any) => typeof v === 'string' ? defSymbolFile(v) : v as SymbolFile) || [def];
++    if (!symFiles || (symFiles.length === 0)) {
++        warn('No "executable" or "symbolFiles" specified. We will try to run program without symbols');
++    } else {
++        for (const symF of symFiles) {
++            let exe = symF.file;
++            if (!exe) {
++                continue;
++            }
++            exe = path.isAbsolute(exe) ? exe : path.join(cwd, exe);
++            exe = path.normalize(exe).replace(/\\/g, '/');
++            if (!config.symbolFiles) {
++                config.executable = exe;
++            } else {
++                symF.file = exe;
++            }
++            adjustStrIntProp(symF, 'offset', `file ${exe}`, warn);
++            adjustStrIntProp(symF, 'textaddress', `file ${exe}`, warn);
++            symF.sectionMap = {};
++            symF.sections = symF.sections || [];
++            for (const section of symF.sections) {
++                adjustStrIntProp(section, 'address', `section ${section.name} of file ${exe}`, warn);
++                symF.sectionMap[section.name] = section;
++            }
++            validateELFHeader(exe, (str: string, fatal: boolean) => {
++                if (fatal) {
++                    warn(str);
++                }
++            });
++        }
++        if (config.symbolFiles) {
++            config.symbolFiles = symFiles;
++        }
++    }
++
++    if (config.loadFiles) {
++        for (let ix = 0; ix < config.loadFiles.length; ix++) {
++            let fName = config.loadFiles[ix];
++            fName = path.isAbsolute(fName) ? fName : path.join(cwd, fName);
++            config.loadFiles[ix] = path.normalize(fName).replace(/\\/g, '/');
++        }
++    } else if (config.executable && config.symbolFiles) {
++        config.loadFiles = [config.executable];
++    }
++}
++
++function verifyJLink(config: any): string | null {
++    if (config.jlinkpath && !config.serverpath) { config.serverpath = config.jlinkpath; }
++    if (!config.interface && config.jlinkInterface) { config.interface = config.jlinkInterface; }
++    if (!config.interface) { config.interface = 'swd'; }
++    if (!config.serverpath) {
++        const found = findJLinkGDBServer();
++        if (found) { config.serverpath = found; }
++    }
++    if (!config.device) {
++        return 'Device Identifier ("device") is required for J-Link configurations, e.g. "STM32F407VG". '
++            + 'See https://www.segger.com/downloads/supported-devices.php';
++    }
++    if (((config.interface === 'jtag') || (config.interface === 'cjtag')) && config.swoConfig.enabled && config.swoConfig.source === 'probe') {
++        return 'SWO Decoding cannot be performed through the J-Link Probe in JTAG mode.';
++    }
++    if (config.rttConfig?.enabled && config.rttConfig.decoders?.length) {
++        let chosenPort: number | undefined;
++        for (const dec of config.rttConfig.decoders) {
++            if (dec.port === undefined) {
++                dec.port = 0;
++            } else if (dec.port < 0 || dec.port > 15) {
++                return `Invalid port/channel '${dec.port}'.  JLink RTT port/channel must be between 0 and 15.`;
++            }
++            if ((chosenPort !== undefined) && (chosenPort !== dec.port)) {
++                return `Port/channel ${dec.port} selected but another decoder is using port ${chosenPort}. `
++                    + 'JLink RTT only allows a single RTT port/channel per debugging session.';
++            }
++            chosenPort = dec.port;
++        }
++    }
++    if (config.rtos) {
++        if (JLINK_VALID_RTOS.indexOf(config.rtos) === -1) {
++            if ('' === path.extname(config.rtos)) {
++                config.rtos = config.rtos + defaultLibExt();
++            }
++            if (!fs.existsSync(config.rtos)) {
++                return `JLink RTOS plugin file "${config.rtos}" not found.\n`
++                    + `The following RTOS values are supported by J-Link: ${JLINK_VALID_RTOS.join(', ')}.`
++                    + ' A custom plugin can be used by supplying a complete path to a J-Link GDB Server Plugin.';
++            }
++        } else {
++            config.rtos = `GDBServer/RTOSPlugin_${config.rtos}` + defaultLibExt();
++        }
++    }
++    return null;
++}
++
++function verifyServer(config: any, warn: Warn): string | null {
++    const disableSwo = () => {
++        config.swoConfig = { enabled: false, decoders: [], cpuFrequency: 0, swoFrequency: 0, source: 'probe' };
++        config.graphConfig = [];
++    };
++    switch (config.servertype) {
++        case 'jlink':
++            return verifyJLink(config);
++        case 'openocd':
++            if (config.openOCDPath && !config.serverpath) { config.serverpath = config.openOCDPath; }
++            if (config.rtos && OPENOCD_VALID_RTOS.indexOf(config.rtos) === -1) {
++                return `The following RTOS values are supported by OpenOCD: ${OPENOCD_VALID_RTOS.join(' ')}.`;
++            }
++            if (!config.configFiles || config.configFiles.length === 0) {
++                return 'At least one OpenOCD Configuration File ("configFiles") must be specified.';
++            }
++            if (!config.searchDir) { config.searchDir = []; }
++            return null;
++        case 'stutil':
++            if (config.stutilpath && !config.serverpath) { config.serverpath = config.stutilpath; }
++            if (config.rtos) { return 'The st-util GDB Server does not have support for the rtos option.'; }
++            if (config.swoConfig.enabled && config.swoConfig.source === 'probe') {
++                warn('SWO support is not available from the probe when using the ST-Util GDB server. Disabling SWO.');
++                disableSwo();
++            }
++            return null;
++        case 'stlink':
++            if (config.stlinkPath && !config.serverpath) { config.serverpath = config.stlinkPath; }
++            if (config.rtos) { return 'The ST-Link GDB Server does not have support for the rtos option.'; }
++            return null;
++        case 'pyocd':
++            if (config.pyocdPath && !config.serverpath) { config.serverpath = config.pyocdPath; }
++            if (config.rtos) { return 'The PyOCD GDB Server does not have support for the rtos option.'; }
++            if (config.board && !config.boardId) { config.boardId = config.board; }
++            if (config.target && !config.targetId) { config.targetId = config.target; }
++            return null;
++        case 'bmp':
++            if (!config.BMPGDBSerialPort) { return 'A Serial Port ("BMPGDBSerialPort") for the Black Magic Probe GDB server is required.'; }
++            if (!config.powerOverBMP) { config.powerOverBMP = 'lastState'; }
++            if (!config.interface) { config.interface = 'swd'; }
++            if (!config.targetId) { config.targetId = 1; }
++            if (config.rtos) { return 'The Black Magic Probe GDB Server does not have support for the rtos option.'; }
++            return null;
++        case 'pe':
++            if (config.configFiles && config.configFiles.length > 1) { return 'Only one pegdbserver Configuration File is allowed.'; }
++            if (!config.device) { return 'Device Identifier is required for PE configurations.'; }
++            if (config.swoConfig.enabled && config.swoConfig.source !== 'socket') { return 'The PE GDB Server Only supports socket type SWO'; }
++            return null;
++        case 'external':
++            if (config.swoConfig.enabled) {
++                if (config.swoConfig.source === 'socket' && !config.swoConfig.swoPort) {
++                    warn('SWO source type "socket" requires a "swoPort". Disabling SWO support.');
++                    disableSwo();
++                } else if (config.swoConfig.source !== 'socket' && !config.swoConfig.swoPath) {
++                    warn(`SWO source type "${config.swoConfig.source}" requires a "swoPath". Disabling SWO support.`);
++                    disableSwo();
++                }
++            }
++            if (!config.gdbTarget) {
++                return 'External GDB server type must specify "gdbTarget": either "hostname:port" or a serial port.';
++            }
++            return null;
++        case 'qemu':
++            if (!config.cpu) { config.cpu = 'cortex-m3'; }
++            if (!config.machine) { config.machine = 'lm3s6965evb'; }
++            if (config.swoConfig.enabled) {
++                warn('SWO support is not available when using QEMU.');
++                disableSwo();
++            }
++            if (config.rtos) { return 'RTOS support is not available when using QEMU'; }
++            return null;
++        default:
++            return 'Invalid or missing "servertype". Supported values: '
++                + ['jlink', 'openocd', 'stutil', 'stlink', 'pyocd', 'bmp', 'pe', 'external', 'qemu'].map((s) => `"${s}"`).join(', ');
++    }
++}
++
++/**
++ * Turns a raw debug.json configuration into what GDBDebugSession expects.
++ * Returns an error string, or null on success. Mutates `config` in place.
++ */
++export function resolveZedConfiguration(config: any, warn: Warn): string | null {
++    // Platform specific overrides (same semantics as launch.json)
++    const plat = os.platform() === 'win32' ? 'windows' : os.platform() === 'darwin' ? 'osx' : 'linux';
++    if (config[plat] && typeof config[plat] === 'object') {
++        Object.assign(config, config[plat]);
++    }
++    delete config.osx;
++    delete config.windows;
++    delete config.linux;
++
++    if (!config.request) { config.request = 'launch'; }
++    if (!config.name) { config.name = 'Cortex Debug'; }
++    config.type = 'cortex-debug';
++
++    // Multi-core / chained sessions need the VS Code frontend to spawn child sessions
++    if (config.chainedConfigurations?.enabled) {
++        warn('"chainedConfigurations" is not supported in Zed yet; ignoring it.');
++    }
++    config.chainedConfigurations = { enabled: false };
++
++    if (config.debugger_args && !config.debuggerArgs) { config.debuggerArgs = config.debugger_args; }
++    if (!config.debuggerArgs) { config.debuggerArgs = []; }
++
++    if (!config.swoConfig) {
++        config.swoConfig = { enabled: false, decoders: [], cpuFrequency: 0, swoFrequency: 0, source: 'probe' };
++    } else if (config.swoConfig.enabled) {
++        const swo = config.swoConfig;
++        if (!swo.cpuFrequency) {
++            swo.cpuFrequency = 1 * 1e6;
++            warn(`Missing/Invalid swoConfig.cpuFrequency. setting to ${swo.cpuFrequency} Hz`);
++        }
++        if (!swo.swoFrequency) {
++            swo.swoFrequency = swo.cpuFrequency / 2;
++            warn(`Missing/Invalid swoConfig.swoFrequency. setting to ${swo.swoFrequency} Hz`);
++        }
++        if (swo.ports && !swo.decoders) { swo.decoders = swo.ports; }
++        if (!swo.swoEncoding) { swo.swoEncoding = 'uart'; }
++        if (!swo.source) { swo.source = 'probe'; }
++        if (!swo.decoders) { swo.decoders = []; }
++        for (const d of swo.decoders) {
++            if (d.type === 'advanced') {
++                if (d.ports === undefined && d.number !== undefined) { d.ports = [d.number]; }
++            } else if (d.port === undefined && d.number !== undefined) {
++                d.port = d.number;
++            }
++        }
++    }
++    if (!config.rttConfig) {
++        config.rttConfig = { enabled: false, decoders: [] };
++    } else if (!config.rttConfig.decoders) {
++        config.rttConfig.decoders = [];
++    }
++
++    if (!config.graphConfig) { config.graphConfig = []; }
++    if (!config.preLaunchCommands) { config.preLaunchCommands = []; }
++    if (!config.postLaunchCommands) { config.postLaunchCommands = []; }
++    if (!config.preAttachCommands) { config.preAttachCommands = []; }
++    if (!config.postAttachCommands) { config.postAttachCommands = []; }
++    if (!config.preResetCommands) { config.preResetCommands = config.preRestartCommands || []; }
++    if (!config.postResetCommands) { config.postResetCommands = config.postRestartCommands || []; }
++    if (config.overridePreEndSessionCommands === undefined) { config.overridePreEndSessionCommands = null; }
++    if (!config.postResetSessionCommands) { config.postResetSessionCommands = config.postRestartSessionCommands || null; }
++    if (config.runToEntryPoint) {
++        config.runToEntryPoint = String(config.runToEntryPoint).trim();
++    } else if (config.runToMain) {
++        config.runToEntryPoint = 'main';
++    }
++
++    if ((config.servertype !== 'openocd') || !config.ctiOpenOCDConfig?.enabled) {
++        delete config.ctiOpenOCDConfig;
++    }
++
++    // Settings that live in VS Code's settings.json for the original extension
++    if (config.pvtAdapterDebugOptions === undefined || typeof config.pvtAdapterDebugOptions !== 'object') {
++        config.pvtAdapterDebugOptions = {};
++    }
++    if (config.showDevDebugOutput === undefined) {
++        config.showDevDebugOutput = ADAPTER_DEBUG_MODE.NONE;
++    }
++    if (!sanitizeDevDebug(config)) {
++        warn(`"showDevDebugOutput" must be one of ${Object.values(ADAPTER_DEBUG_MODE).join(',')}. Setting to "${config.showDevDebugOutput}"`);
++    }
++    if (config.armToolchainPath && !config.toolchainPath) { config.toolchainPath = config.armToolchainPath; }
++    if (!config.toolchainPrefix) { config.toolchainPrefix = config.armToolchainPrefix || 'arm-none-eabi'; }
++    if (config.registerUseNaturalFormat === undefined) { config.registerUseNaturalFormat = true; }
++    if (config.variableUseNaturalFormat === undefined) { config.variableUseNaturalFormat = true; }
++
++    // GDB doesn't interpret the path correctly with backslashes.
++    config.extensionPath = PACKAGE_ROOT.replace(/\\/g, '/');
++    config.pvtVersion = `${ZED_ADAPTER_VERSION} (Zed)`;
++    config.pvtAvoidPorts = config.pvtAvoidPorts || [];
++
++    let err = verifyServer(config, warn);
++    if (err) {
++        return err;
++    }
++
++    // --- equivalent of resolveDebugConfigurationWithSubstitutedVariables ---
++    let cwd: string = config.cwd || process.cwd();
++    if (!path.isAbsolute(cwd)) {
++        cwd = path.resolve(cwd);
++    }
++    config.cwd = cwd;
++    if (!fs.existsSync(cwd)) {
++        warn(`Invalid "cwd": "${cwd}". Many operations can fail. Trying to continue`);
++    }
++    validateLoadAndSymbolFiles(config, cwd, warn);
++
++    if (config.liveWatch?.enabled) {
++        warn('Live Watch has no UI in Zed yet; disabling it.');
++        config.liveWatch.enabled = false;
++    }
++    return null;
++}
++
++// ---------------------------------------------------------------------------
++// gdb-server console replacement
++// ---------------------------------------------------------------------------
++
++// eslint-disable-next-line no-control-regex
++const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
++
++type ServerOutputMode = 'console' | 'none' | { file: string };
++
++class ServerConsole {
++    private server: net.Server | null = null;
++    private fileStream: fs.WriteStream | null = null;
++    public port = -1;
++
++    constructor(private mode: ServerOutputMode, private emit: (text: string) => void) {}
++
++    public start(): Promise<number> {
++        if (typeof this.mode === 'object') {
++            try {
++                fs.mkdirSync(path.dirname(this.mode.file), { recursive: true });
++                this.fileStream = fs.createWriteStream(this.mode.file, { flags: 'a' });
++            } catch (e) {
++                this.emit(`Could not open gdb-server log file "${this.mode.file}": ${e}\n`);
++            }
++        }
++        return new Promise((resolve, reject) => {
++            this.server = net.createServer((socket) => {
++                socket.setEncoding('utf8');
++                socket.on('data', (data: string) => this.onData(data));
++                socket.on('error', () => { /* adapter/server went away */ });
++            });
++            this.server.on('error', reject);
++            this.server.listen(0, '127.0.0.1', () => {
++                this.port = (this.server!.address() as net.AddressInfo).port;
++                resolve(this.port);
++            });
++        });
++    }
++
++    private onData(data: string) {
++        const text = data.replace(ANSI_RE, '');
++        if (this.fileStream) {
++            this.fileStream.write(text);
++        } else if (this.mode === 'console') {
++            this.emit(text);
++        }
++    }
++
++    public stop() {
++        try { this.server?.close(); } catch { /* ignore */ }
++        try { this.fileStream?.end(); } catch { /* ignore */ }
++        this.server = null;
++        this.fileStream = null;
++    }
++}
++
++// ---------------------------------------------------------------------------
++// The session
++// ---------------------------------------------------------------------------
++
++export class ZedCortexDebugSession extends GDBDebugSession {
++    private serverConsole: ServerConsole | null = null;
++
++    private out(text: string, category: 'console' | 'stdout' | 'stderr' | 'important' = 'console') {
++        super.sendEvent(new OutputEvent(text.endsWith('\n') ? text : text + '\n', category));
++    }
++
++    private startLaunchOrAttach(
++        response: DebugProtocol.LaunchResponse | DebugProtocol.AttachResponse,
++        args: ConfigurationArguments,
++        attach: boolean
++    ) {
++        const cfg: any = args;
++        if (attach) { cfg.request = 'attach'; } else if (!cfg.request) { cfg.request = 'launch'; }
++
++        const err = resolveZedConfiguration(cfg, (msg) => this.out('cortex-debug: ' + msg, 'stderr'));
++        if (err) {
++            this.out('cortex-debug: ' + err, 'stderr');
++            this.sendErrorResponse(response, 1001, err);
++            return;
++        }
++
++        let mode: ServerOutputMode = 'console';
++        const opt = cfg.gdbServerOutput;
++        if (opt === 'none') {
++            mode = 'none';
++        } else if (typeof opt === 'string' && opt !== 'console') {
++            mode = { file: path.isAbsolute(opt) ? opt : path.join(cfg.cwd, opt) };
++        }
++        this.serverConsole = new ServerConsole(mode, (text) => this.out(text, 'stdout'));
++        this.serverConsole.start().then((port) => {
++            cfg.gdbServerConsolePort = port;
++            if (attach) {
++                super.attachRequest(response as DebugProtocol.AttachResponse, cfg);
++            } else {
++                super.launchRequest(response as DebugProtocol.LaunchResponse, cfg);
++            }
++        }, (e) => {
++            const msg = `Could not start gdb-server console listener: ${e}`;
++            this.out(msg, 'stderr');
++            this.sendErrorResponse(response, 1002, msg);
++        });
++    }
++
++    protected launchRequest(response: DebugProtocol.LaunchResponse, args: ConfigurationArguments): void {
++        this.startLaunchOrAttach(response, args, false);
++    }
++
++    protected attachRequest(response: DebugProtocol.AttachResponse, args: ConfigurationArguments): void {
++        this.startLaunchOrAttach(response, args, true);
++    }
++
++    protected async disconnectRequest(response: DebugProtocol.DisconnectResponse, args: DebugProtocol.DisconnectArguments): Promise<void> {
++        await super.disconnectRequest(response, args);
++        // Give the adapter a moment to flush the last gdb-server output
++        setTimeout(() => this.serverConsole?.stop(), 2000);
++    }
++
++    /**
++     * The adapter reports a few things to the VS Code frontend via custom events that
++     * Zed does not understand. Turn the useful ones into debug console text.
++     */
++    public sendEvent(event: DebugProtocol.Event): void {
++        const name = event.event || '';
++        if (name.startsWith('custom-')) {
++            const info = (event.body as any)?.info;
++            switch (name) {
++                case 'custom-event-popup':
++                    if (info?.message) {
++                        this.out(`cortex-debug ${info.type || 'info'}: ${info.message}`, info.type === 'error' ? 'stderr' : 'console');
++                    }
++                    break;
++                case 'custom-event-post-start-server':
++                    this.reportStreams(info);
++                    break;
++                default:
++                    break;
++            }
++            return;     // Never forward VS Code-specific custom events (custom-event-*, custom-stop, ...)
++        }
++        super.sendEvent(event);
++    }
++
++    private reportStreams(args: any) {
++        try {
++            const rtt = args?.rttConfig;
++            if (rtt?.enabled) {
++                for (const dec of rtt.decoders || []) {
++                    const ports = dec.tcpPorts || (dec.tcpPort ? [dec.tcpPort] : []);
++                    for (const p of ports) {
++                        this.out(`cortex-debug: RTT channel ${dec.port ?? (dec.ports || []).join(',')} is available on TCP ${p.includes(':') ? p : 'localhost:' + p}`
++                            + ' (connect with e.g. `telnet`, `nc` or PuTTY "Raw")');
++                    }
++                }
++            }
++            const swo = args?.swoConfig;
++            if (swo?.enabled) {
++                this.out('cortex-debug: SWO is enabled. SWO decoding/graphing UI is not available in Zed; '
++                    + 'use the J-Link SWO Viewer or read the raw stream from the gdb-server SWO port.');
++            }
++        } catch {
++            // informational only
++        }
++    }
++}
++
++try {
++    LoggingDebugSession.run(ZedCortexDebugSession);
++} catch (error) {
++    console.error('cortex-debug (zed): Error occurred while running session:', error);
++    ServerConsoleLog('cortex-debug (zed): Caught exception: ' + String(error));
++    throw error;
++}
+diff --git a/webpack.config.js b/webpack.config.js
+index 59736b6..9cf97c5 100644
+--- a/webpack.config.js
++++ b/webpack.config.js
+@@ -48,7 +48,7 @@ const extensionConfig = {
+ 
+ const adapterConfig = {
+     target: 'node',
+-    entry: './src/gdb.ts',
++    entry: './src/debugadapter-main.ts',
+     output: {
+         path: path.resolve(__dirname, 'dist'),
+         filename: 'debugadapter.js',
+@@ -150,4 +150,12 @@ const docgenConfig = {
+     ]
+ };
+ 
+-module.exports = [extensionConfig, adapterConfig, grapherConfig, docgenConfig];
++// Stand-alone adapter for the Zed editor (see src/zed/adapter.ts). Build only this with:
++//   npx webpack --config-name zedAdapter --mode production
++const zedAdapterConfig = Object.assign({}, adapterConfig, {
++    name: 'zedAdapter',
++    entry: './src/zed/adapter.ts',
++    output: Object.assign({}, adapterConfig.output, { filename: 'zedadapter.js' })
++});
++
++module.exports = [extensionConfig, adapterConfig, grapherConfig, docgenConfig, zedAdapterConfig];
+-- 
+2.43.0
+
