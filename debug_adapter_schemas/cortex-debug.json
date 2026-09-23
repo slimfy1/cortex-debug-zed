@@ -925,9 +925,14 @@
       "description": "This path is normally resolved to the installed STM32CubeIDE or STM32CubeProgrammer but can be overridden here.",
       "type": "string"
     },
+    "svdAddrGapThreshold": {
+      "type": "number",
+      "default": 16,
+      "description": "[Zed] Registers of a peripheral closer than this many bytes are read in one memory transfer. Set to 0 if reading reserved gaps causes bus faults on your device."
+    },
     "svdFile": {
       "default": null,
-      "description": "This is for 'XPERIPHERALS' window provided by 'mcu-debug.peripheral-viewer'. It can be a simple file name or more based on a CMSIS pack or deviceName. See 'mcu-debug.peripheral-viewer' for format",
+      "description": "Path to a CMSIS-SVD file for the device. In Zed, its peripherals, registers and bit fields appear as a \"Peripherals\" scope in the Variables panel (read on expand, editable).",
       "type": "string"
     },
     "svdPath": {

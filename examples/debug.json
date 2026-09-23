@@ -11,6 +11,9 @@
     "executable": "build/firmware.elf",
     "runToEntryPoint": "main",
 
+    // Optional: peripheral registers in the Variables panel ("Peripherals" scope)
+    "svdFile": "STM32F407.svd",
+
     // Optional: only needed if the tools are not on PATH / not auto-detected
     // "serverpath": "C:/Program Files/SEGGER/JLink/JLinkGDBServerCL.exe",
     // "armToolchainPath": "C:/Program Files (x86)/Arm GNU Toolchain arm-none-eabi/14.2 rel1/bin",

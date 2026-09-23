@@ -1,0 +1,1057 @@
+From f4aa95a258eedcccf96957420273260ae662b06e Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 23 Sep 2026 23:29:40 +0300
+Subject: [PATCH 2/3] zed: SVD peripheral registers as a Peripherals variables
+ scope
+
+- src/zed/svd.ts: CMSIS-SVD parser (derivedFrom, dim arrays, clusters,
+  property inheritance, bitRange/lsb-msb fields, enumeratedValues, readAction)
+- src/zed/peripherals.ts: lazy, grouped memory reads cached per stop;
+  setVariable writes registers and fields (read-modify-write, enum names)
+- adapter.ts: load svdFile, add the scope, route variables/setVariable,
+  invalidate on run/step/REPL commands
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UStNUDdj88B9YWgFcwipyi
+---
+ package-lock.json      |  31 +++
+ package.json           |   1 +
+ src/zed/adapter.ts     | 102 +++++++++-
+ src/zed/peripherals.ts | 363 +++++++++++++++++++++++++++++++++++
+ src/zed/svd.ts         | 427 +++++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 920 insertions(+), 4 deletions(-)
+ create mode 100644 src/zed/peripherals.ts
+ create mode 100644 src/zed/svd.ts
+
+diff --git a/package-lock.json b/package-lock.json
+index 295d994..b5af409 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -17,6 +17,7 @@
+                 "commander": "^13.0.0",
+                 "d3": "^7.9.0",
+                 "debug": "^4.4.0",
++                "fast-xml-parser": "^4.5.7",
+                 "hasbin": "^1.2.3",
+                 "json-stream-stringify": "^3.1.6",
+                 "nan": "^2.22.0",
+@@ -2935,6 +2936,24 @@
+             ],
+             "license": "BSD-3-Clause"
+         },
++        "node_modules/fast-xml-parser": {
++            "version": "4.5.7",
++            "resolved": "https://registry.npmjs.org/fast-xml-parser/-/fast-xml-parser-4.5.7.tgz",
++            "integrity": "sha512-a6Qh1RMCNbSrU1+sAyAAZH3rTe+OaWJbNZIq0S+ifZciUUOQtlVxBJwoTUE2bYhysmG/RYyI5WJFIKdBahJdrQ==",
++            "funding": [
++                {
++                    "type": "github",
++                    "url": "https://github.com/sponsors/NaturalIntelligence"
++                }
++            ],
++            "license": "MIT",
++            "dependencies": {
++                "strnum": "^1.0.5"
++            },
++            "bin": {
++                "fxparser": "src/cli/cli.js"
++            }
++        },
+         "node_modules/fastest-levenshtein": {
+             "version": "1.0.16",
+             "resolved": "https://registry.npmjs.org/fastest-levenshtein/-/fastest-levenshtein-1.0.16.tgz",
+@@ -5085,6 +5104,18 @@
+                 "url": "https://github.com/sponsors/sindresorhus"
+             }
+         },
++        "node_modules/strnum": {
++            "version": "1.1.2",
++            "resolved": "https://registry.npmjs.org/strnum/-/strnum-1.1.2.tgz",
++            "integrity": "sha512-vrN+B7DBIoTTZjnPNewwhx6cBA/H+IS7rfW68n7XxC1y7uoiGQBxaKzqucGUgavX15dJgiGztLJ8vxuEzwqBdA==",
++            "funding": [
++                {
++                    "type": "github",
++                    "url": "https://github.com/sponsors/NaturalIntelligence"
++                }
++            ],
++            "license": "MIT"
++        },
+         "node_modules/supports-color": {
+             "version": "8.1.1",
+             "resolved": "https://registry.npmjs.org/supports-color/-/supports-color-8.1.1.tgz",
+diff --git a/package.json b/package.json
+index ff9afa6..99538f4 100644
+--- a/package.json
++++ b/package.json
+@@ -3125,6 +3125,7 @@
+         "commander": "^13.0.0",
+         "d3": "^7.9.0",
+         "debug": "^4.4.0",
++        "fast-xml-parser": "^4.5.7",
+         "hasbin": "^1.2.3",
+         "json-stream-stringify": "^3.1.6",
+         "nan": "^2.22.0",
+diff --git a/src/zed/adapter.ts b/src/zed/adapter.ts
+index e74a5a3..65a970b 100644
+--- a/src/zed/adapter.ts
++++ b/src/zed/adapter.ts
+@@ -23,10 +23,12 @@ import * as fs from 'fs';
+ import * as net from 'net';
+ import * as os from 'os';
+ import * as path from 'path';
+-import { LoggingDebugSession, OutputEvent } from '@vscode/debugadapter';
++import { InvalidatedEvent, LoggingDebugSession, OutputEvent } from '@vscode/debugadapter';
+ import { DebugProtocol } from '@vscode/debugprotocol';
+ import { GDBDebugSession } from '../gdb';
+ import { ServerConsoleLog } from '../backend/server';
++import { loadSvd } from './svd';
++import { PeripheralProvider } from './peripherals';
+ import { ADAPTER_DEBUG_MODE, ConfigurationArguments, defSymbolFile, sanitizeDevDebug, SymbolFile, validateELFHeader } from '../common';
+ 
+ // Version of this Zed port; bump together with zed-extension/extension.toml
+@@ -388,7 +390,7 @@ export function resolveZedConfiguration(config: any, warn: Warn): string | null
+     config.pvtVersion = `${ZED_ADAPTER_VERSION} (Zed)`;
+     config.pvtAvoidPorts = config.pvtAvoidPorts || [];
+ 
+-    let err = verifyServer(config, warn);
++    const err = verifyServer(config, warn);
+     if (err) {
+         return err;
+     }
+@@ -444,7 +446,7 @@ class ServerConsole {
+             });
+             this.server.on('error', reject);
+             this.server.listen(0, '127.0.0.1', () => {
+-                this.port = (this.server!.address() as net.AddressInfo).port;
++                this.port = (this.server.address() as net.AddressInfo).port;
+                 resolve(this.port);
+             });
+         });
+@@ -473,6 +475,38 @@ class ServerConsole {
+ 
+ export class ZedCortexDebugSession extends GDBDebugSession {
+     private serverConsole: ServerConsole | null = null;
++    private periph: PeripheralProvider | null = null;
++
++    /** Loads "svdFile" (if any) and sets up the Peripherals scope */
++    private setupPeripherals(cfg: any) {
++        this.periph = null;
++        if (!cfg.svdFile) {
++            return;
++        }
++        const file = path.isAbsolute(cfg.svdFile) ? cfg.svdFile : path.join(cfg.cwd, cfg.svdFile);
++        try {
++            const t0 = Date.now();
++            const device = loadSvd(file);
++            this.periph = new PeripheralProvider(device, {
++                read: async (address, length) => {
++                    const node = await this.miDebugger.sendCommand(`data-read-memory-bytes 0x${address.toString(16)} ${length}`);
++                    const contents = node.result('memory[0].contents');
++                    if (typeof contents !== 'string') {
++                        throw new Error('no data');
++                    }
++                    return contents;
++                },
++                write: async (address, hexBytes) => {
++                    await this.miDebugger.sendCommand(`data-write-memory-bytes 0x${address.toString(16)} ${hexBytes}`);
++                }
++            }, cfg.svdAddrGapThreshold);
++            const nRegs = device.nodes.filter((n) => n.kind === 'register').length;
++            this.out(`cortex-debug: loaded SVD "${path.basename(file)}": ${device.peripherals.length} peripherals, `
++                + `${nRegs} registers (${Date.now() - t0} ms). See the "Peripherals" scope in the Variables panel.`);
++        } catch (e) {
++            this.out(`cortex-debug: could not load svdFile "${file}": ${e instanceof Error ? e.message : e}`, 'stderr');
++        }
++    }
+ 
+     private out(text: string, category: 'console' | 'stdout' | 'stderr' | 'important' = 'console') {
+         super.sendEvent(new OutputEvent(text.endsWith('\n') ? text : text + '\n', category));
+@@ -500,6 +534,8 @@ export class ZedCortexDebugSession extends GDBDebugSession {
+         } else if (typeof opt === 'string' && opt !== 'console') {
+             mode = { file: path.isAbsolute(opt) ? opt : path.join(cfg.cwd, opt) };
+         }
++        this.setupPeripherals(cfg);
++
+         this.serverConsole = new ServerConsole(mode, (text) => this.out(text, 'stdout'));
+         this.serverConsole.start().then((port) => {
+             cfg.gdbServerConsolePort = port;
+@@ -523,6 +559,61 @@ export class ZedCortexDebugSession extends GDBDebugSession {
+         this.startLaunchOrAttach(response, args, true);
+     }
+ 
++    // ---- SVD peripherals exposed as a variables scope ----
++
++    public sendResponse(response: DebugProtocol.Response): void {
++        if (this.periph && response.command === 'scopes' && response.success) {
++            const scopes = (response as DebugProtocol.ScopesResponse).body?.scopes;
++            // cortex-debug returns no scopes while the target is running; only add ours when stopped
++            if (scopes && scopes.length > 0) {
++                scopes.push(this.periph.scope());
++            }
++        }
++        super.sendResponse(response);
++    }
++
++    protected async variablesRequest(response: DebugProtocol.VariablesResponse, args: DebugProtocol.VariablesArguments): Promise<void> {
++        if (!this.periph || !PeripheralProvider.isOurs(args.variablesReference)) {
++            return super.variablesRequest(response, args);
++        }
++        response.body = { variables: [] };
++        if (!this.isMIStatusStopped()) {
++            this.sendResponse(response);
++            return;
++        }
++        try {
++            response.body.variables = await this.periph.variables(args.variablesReference);
++            this.sendResponse(response);
++        } catch (e) {
++            this.sendErrorResponse(response, 1101, `Peripherals: ${e instanceof Error ? e.message : e}`);
++        }
++    }
++
++    protected async setVariableRequest(response: DebugProtocol.SetVariableResponse, args: DebugProtocol.SetVariableArguments): Promise<void> {
++        if (!this.periph || !PeripheralProvider.isOurs(args.variablesReference)) {
++            this.periph?.invalidate();      // a variable write may alias a peripheral register
++            return super.setVariableRequest(response, args);
++        }
++        if (!this.isMIStatusStopped()) {
++            this.sendErrorResponse(response, 1102, 'Target is running; pause it before writing registers');
++            return;
++        }
++        try {
++            response.body = await this.periph.setVariable(args.variablesReference, args.name, args.value);
++            this.sendResponse(response);
++            super.sendEvent(new InvalidatedEvent(['variables']));
++        } catch (e) {
++            this.sendErrorResponse(response, 1103, `${e instanceof Error ? e.message : e}`);
++        }
++    }
++
++    protected evaluateRequest(response: DebugProtocol.EvaluateResponse, args: DebugProtocol.EvaluateArguments): Promise<void> {
++        if (args.context === 'repl') {
++            this.periph?.invalidate();      // e.g. "monitor reset" or "set var ..." from the Debug Console
++        }
++        return super.evaluateRequest(response, args);
++    }
++
+     protected async disconnectRequest(response: DebugProtocol.DisconnectResponse, args: DebugProtocol.DisconnectArguments): Promise<void> {
+         await super.disconnectRequest(response, args);
+         // Give the adapter a moment to flush the last gdb-server output
+@@ -535,8 +626,11 @@ export class ZedCortexDebugSession extends GDBDebugSession {
+      */
+     public sendEvent(event: DebugProtocol.Event): void {
+         const name = event.event || '';
++        if (name === 'stopped' || name === 'continued') {
++            this.periph?.invalidate();
++        }
+         if (name.startsWith('custom-')) {
+-            const info = (event.body as any)?.info;
++            const info = (event.body)?.info;
+             switch (name) {
+                 case 'custom-event-popup':
+                     if (info?.message) {
+diff --git a/src/zed/peripherals.ts b/src/zed/peripherals.ts
+new file mode 100644
+index 0000000..9816041
+--- /dev/null
++++ b/src/zed/peripherals.ts
+@@ -0,0 +1,363 @@
++/*
++ * "Peripherals" scope for the Zed port: exposes SVD peripherals/registers/fields through the
++ * standard DAP scopes/variables/setVariable requests, so Zed's Variables panel acts as a
++ * peripheral register viewer. Values are read lazily (when a peripheral/cluster/register is
++ * expanded) and cached until the target runs again.
++ */
++
++import { DebugProtocol } from '@vscode/debugprotocol';
++import {
++    isReadable, isWritable, parseSvdNumber, SvdCluster, SvdDevice, SvdField, SvdNode, SvdPeripheral, SvdRegister
++} from './svd';
++
++/** Our slice of the variablesReference space. Must stay below 2^31 (DAP limit) and away from
++ *  cortex-debug's own handles, which count up from ~0x300000 and are reset on every stop. */
++export const PERIPH_REF_ROOT = 0x70000000;
++const PERIPH_REF_LIMIT = 0x7FFFFFFF;
++
++export interface MemoryAccess {
++    /** Returns the bytes as a hex string (like gdb's data-read-memory-bytes contents) */
++    read(address: number, length: number): Promise<string>;
++    write(address: number, hexBytes: string): Promise<void>;
++}
++
++type CacheEntry = bigint | Error;
++
++const B0 = BigInt(0);
++const B1 = BigInt(1);
++const B_FF = BigInt(0xFF);
++
++const NO_READ_WRITE_ONLY = '<write-only>';
++const NO_READ_SIDE_EFFECT = '<not read: read has side effects>';
++
++function hex(v: bigint, bits: number): string {
++    return '0x' + v.toString(16).toUpperCase().padStart(Math.max(1, Math.ceil(bits / 4)), '0');
++}
++
++function cType(bits: number): string {
++    switch (bits) {
++        case 8: return 'unsigned char';
++        case 16: return 'unsigned short';
++        case 64: return 'unsigned long long';
++        default: return 'unsigned int';
++    }
++}
++
++function accessTag(a: string): string {
++    switch (a) {
++        case 'read-only': return 'ro';
++        case 'write-only': return 'wo';
++        case 'writeOnce': return 'w1';
++        case 'read-writeOnce': return 'rw1';
++        default: return 'rw';
++    }
++}
++
++export class PeripheralProvider {
++    private cache = new Map<number, CacheEntry>();
++    private readonly gap: number;
++
++    constructor(public readonly device: SvdDevice, private mem: MemoryAccess, gapThreshold?: number) {
++        this.gap = (typeof gapThreshold === 'number' && gapThreshold >= 0) ? gapThreshold : 16;
++    }
++
++    public static isOurs(ref: number): boolean {
++        return ref >= PERIPH_REF_ROOT && ref <= PERIPH_REF_LIMIT;
++    }
++
++    public scope(): DebugProtocol.Scope {
++        return {
++            name: `Peripherals (${this.device.name})`,
++            variablesReference: PERIPH_REF_ROOT,
++            expensive: true,
++            presentationHint: 'registers'
++        };
++    }
++
++    /** Call whenever the target may have changed state (run, step, reset, memory write) */
++    public invalidate() {
++        this.cache.clear();
++    }
++
++    private ref(node: SvdNode): number {
++        return PERIPH_REF_ROOT + 1 + node.id;
++    }
++
++    private nodeOf(ref: number): SvdNode | undefined {
++        if (ref === PERIPH_REF_ROOT) {
++            return undefined;
++        }
++        return this.device.nodes[ref - PERIPH_REF_ROOT - 1];
++    }
++
++    // ------------------------------------------------------------------ reading
++
++    private async readRegisters(regs: SvdRegister[]): Promise<void> {
++        const todo = regs.filter((r) => isReadable(r) && !this.cache.has(r.id)).sort((a, b) => a.address - b.address);
++        if (todo.length === 0) {
++            return;
++        }
++        // Merge neighbouring registers into ranges so a peripheral takes a few memory reads, not dozens
++        const groups: SvdRegister[][] = [];
++        let cur: SvdRegister[] = [];
++        let end = 0;
++        for (const r of todo) {
++            const bytes = r.size / 8;
++            if (cur.length && (r.address - end <= this.gap) && (r.address + bytes - cur[0].address <= 1024)) {
++                cur.push(r);
++                end = Math.max(end, r.address + bytes);
++            } else {
++                if (cur.length) {
++                    groups.push(cur);
++                }
++                cur = [r];
++                end = r.address + bytes;
++            }
++        }
++        if (cur.length) {
++            groups.push(cur);
++        }
++
++        for (const g of groups) {
++            const start = g[0].address;
++            const stop = Math.max(...g.map((r) => r.address + r.size / 8));
++            try {
++                const data = await this.mem.read(start, stop - start);
++                for (const r of g) {
++                    this.cache.set(r.id, this.decode(data, r.address - start, r.size / 8));
++                }
++            } catch (e) {
++                // A gap inside the range may be unmapped; retry register by register
++                for (const r of g) {
++                    try {
++                        const data = await this.mem.read(r.address, r.size / 8);
++                        this.cache.set(r.id, this.decode(data, 0, r.size / 8));
++                    } catch (e2) {
++                        this.cache.set(r.id, e2 instanceof Error ? e2 : new Error(String(e2)));
++                    }
++                }
++            }
++        }
++    }
++
++    private decode(hexData: string, offset: number, bytes: number): bigint {
++        const slice = hexData.substr(offset * 2, bytes * 2);
++        if (slice.length < bytes * 2) {
++            throw new Error('short read');
++        }
++        const b: string[] = [];
++        for (let i = 0; i < bytes; i++) {
++            b.push(slice.substr(i * 2, 2));
++        }
++        if (this.device.littleEndian) {
++            b.reverse();
++        }
++        return BigInt('0x' + b.join(''));
++    }
++
++    private encode(value: bigint, bytes: number): string {
++        const b: string[] = [];
++        for (let i = 0; i < bytes; i++) {
++            b.push(Number((value >> BigInt(8 * i)) & B_FF).toString(16).padStart(2, '0'));
++        }
++        if (!this.device.littleEndian) {
++            b.reverse();
++        }
++        return b.join('');
++    }
++
++    private fieldValue(f: SvdField, regVal: bigint): bigint {
++        return (regVal >> BigInt(f.bitOffset)) & ((B1 << BigInt(f.bitWidth)) - B1);
++    }
++
++    // ------------------------------------------------------------------ presentation
++
++    private registerValue(r: SvdRegister): string {
++        if (r.access === 'write-only') {
++            return NO_READ_WRITE_ONLY;
++        }
++        if (r.readAction) {
++            return NO_READ_SIDE_EFFECT;
++        }
++        const v = this.cache.get(r.id);
++        if (v === undefined) {
++            return '…';
++        }
++        if (v instanceof Error) {
++            return `<error: ${v.message}>`;
++        }
++        return hex(v, r.size);
++    }
++
++    private fieldText(f: SvdField, v: bigint): string {
++        const raw = f.bitWidth === 1 ? v.toString() : `${hex(v, f.bitWidth)} (${v.toString()})`;
++        const en = f.enums.find((e) => e.value === v) || f.enums.find((e) => e.isDefault);
++        return en ? `${en.name} = ${raw}` : raw;
++    }
++
++    private childVar(c: SvdCluster | SvdRegister | SvdPeripheral): DebugProtocol.Variable {
++        if (c.kind === 'peripheral') {
++            return {
++                name: c.name,
++                value: hex(BigInt(c.baseAddress), 32) + (c.description ? `  ${c.description}` : ''),
++                type: c.groupName ? `peripheral (${c.groupName})` : 'peripheral',
++                variablesReference: this.ref(c),
++                presentationHint: { kind: 'class', attributes: ['readOnly'] }
++            };
++        }
++        if (c.kind === 'cluster') {
++            return {
++                name: c.name,
++                value: hex(BigInt(c.address), 32) + (c.description ? `  ${c.description}` : ''),
++                type: 'cluster',
++                variablesReference: this.ref(c),
++                presentationHint: { kind: 'class', attributes: ['readOnly'] }
++            };
++        }
++        const attrs: string[] = [];
++        if (!isWritable(c.access)) {
++            attrs.push('readOnly');
++        }
++        return {
++            name: c.name,
++            value: this.registerValue(c),
++            type: `${accessTag(c.access)} u${c.size} @ ${hex(BigInt(c.address), 32)}${c.description ? ' — ' + c.description : ''}`,
++            variablesReference: c.fields.length ? this.ref(c) : 0,
++            evaluateName: `*(volatile ${cType(c.size)} *)${hex(BigInt(c.address), 32)}`,
++            memoryReference: hex(BigInt(c.address), 32),
++            presentationHint: { kind: 'property', attributes: attrs }
++        };
++    }
++
++    private fieldVar(f: SvdField, regVal: CacheEntry | undefined): DebugProtocol.Variable {
++        let value: string;
++        if (f.parent.access === 'write-only' || f.access === 'write-only') {
++            value = NO_READ_WRITE_ONLY;
++        } else if (f.parent.readAction) {
++            value = NO_READ_SIDE_EFFECT;
++        } else if (regVal === undefined) {
++            value = '…';
++        } else if (regVal instanceof Error) {
++            value = `<error: ${regVal.message}>`;
++        } else {
++            value = this.fieldText(f, this.fieldValue(f, regVal));
++        }
++        const hi = f.bitOffset + f.bitWidth - 1;
++        const bits = f.bitWidth === 1 ? `[${f.bitOffset}]` : `[${hi}:${f.bitOffset}]`;
++        const enumList = f.enums.filter((e) => e.value !== undefined).map((e) => `${e.name}=${e.value}`).join(', ');
++        return {
++            name: f.name,
++            value,
++            type: `${accessTag(f.access)} ${bits}${f.description ? ' — ' + f.description : ''}${enumList ? ' {' + enumList + '}' : ''}`,
++            variablesReference: 0,
++            presentationHint: { kind: 'property', attributes: isWritable(f.access) && isWritable(f.parent.access) ? [] : ['readOnly'] }
++        };
++    }
++
++    public async variables(ref: number): Promise<DebugProtocol.Variable[]> {
++        if (ref === PERIPH_REF_ROOT) {
++            return this.device.peripherals.map((p) => this.childVar(p));
++        }
++        const node = this.nodeOf(ref);
++        if (!node) {
++            return [];
++        }
++        if (node.kind === 'peripheral' || node.kind === 'cluster') {
++            await this.readRegisters(node.children.filter((c): c is SvdRegister => c.kind === 'register'));
++            return node.children.map((c) => this.childVar(c));
++        }
++        if (node.kind === 'register') {
++            await this.readRegisters([node]);
++            const v = this.cache.get(node.id);
++            return node.fields.map((f) => this.fieldVar(f, v));
++        }
++        return [];
++    }
++
++    // ------------------------------------------------------------------ writing
++
++    private parseInput(input: string, width: number, field?: SvdField): bigint {
++        const s = input.trim();
++        let v: bigint | undefined;
++        if (field) {
++            const byName = field.enums.find((e) => e.name.toLowerCase() === s.toLowerCase() && e.value !== undefined);
++            if (byName) {
++                v = byName.value;
++            }
++        }
++        if (v === undefined) {
++            // Accept the "NAME = 0x2 (2)" text we display as well as plain numbers
++            const m = /=\s*(\S+)/.exec(s);
++            v = parseSvdNumber(m ? m[1] : s.split(/\s/)[0]);
++        }
++        if (v === undefined || v < B0) {
++            throw new Error(`cannot parse "${input}" (use hex 0x.., decimal, binary 0b.. or an enum name)`);
++        }
++        if (v >= (B1 << BigInt(width))) {
++            throw new Error(`value ${hex(v, width)} does not fit in ${width} bit(s)`);
++        }
++        return v;
++    }
++
++    public async setVariable(ref: number, name: string, value: string): Promise<DebugProtocol.SetVariableResponse['body']> {
++        const parent = this.nodeOf(ref);
++        if (!parent) {
++            throw new Error('peripherals cannot be assigned; expand one and edit a register or field');
++        }
++        let reg: SvdRegister;
++        let field: SvdField | undefined;
++        if (parent.kind === 'register') {
++            reg = parent;
++            field = parent.fields.find((f) => f.name === name);
++            if (!field) {
++                throw new Error(`no field ${name} in ${reg.name}`);
++            }
++        } else if (parent.kind === 'peripheral' || parent.kind === 'cluster') {
++            const r = parent.children.find((c) => c.name === name);
++            if (!r || r.kind !== 'register') {
++                throw new Error(`${name} is not a register`);
++            }
++            reg = r;
++        } else {
++            throw new Error('not writable');
++        }
++        if (!isWritable(reg.access) || (field && !isWritable(field.access))) {
++            throw new Error(`${field ? field.name : reg.name} is read-only`);
++        }
++
++        const bytes = reg.size / 8;
++        let newReg: bigint;
++        if (field) {
++            const fv = this.parseInput(value, field.bitWidth, field);
++            let cur: bigint;
++            if (isReadable(reg)) {
++                this.cache.delete(reg.id);
++                await this.readRegisters([reg]);
++                const c = this.cache.get(reg.id);
++                if (c === undefined || c instanceof Error) {
++                    throw new Error(`cannot read ${reg.name} for read-modify-write: ${c instanceof Error ? c.message : 'unknown'}`);
++                }
++                cur = c;
++            } else {
++                cur = reg.resetValue ?? B0;
++            }
++            const mask = ((B1 << BigInt(field.bitWidth)) - B1) << BigInt(field.bitOffset);
++            newReg = (cur & ~mask) | (fv << BigInt(field.bitOffset));
++        } else {
++            newReg = this.parseInput(value, reg.size);
++        }
++
++        await this.mem.write(reg.address, this.encode(newReg, bytes));
++        this.invalidate();
++
++        // Read back so the UI shows what the hardware actually holds
++        await this.readRegisters([reg]);
++        const back = this.cache.get(reg.id);
++        if (field) {
++            const v = this.fieldVar(field, back);
++            return { value: v.value, type: v.type, variablesReference: 0 };
++        }
++        const v = this.childVar(reg);
++        return { value: v.value, type: v.type, variablesReference: v.variablesReference };
++    }
++}
+diff --git a/src/zed/svd.ts b/src/zed/svd.ts
+new file mode 100644
+index 0000000..1d38737
+--- /dev/null
++++ b/src/zed/svd.ts
+@@ -0,0 +1,427 @@
++/*
++ * Minimal CMSIS-SVD model for the Zed port of Cortex-Debug.
++ *
++ * Parses a .svd file into a flat, indexed tree (peripheral -> cluster* -> register -> field)
++ * so that every node gets a stable numeric id that can be used as a DAP variablesReference.
++ *
++ * Supported: derivedFrom (peripherals, clusters, registers), dim arrays (dim/dimIncrement/dimIndex,
++ * "%s" and "[%s]" names), nested clusters, register property inheritance (size, access, resetValue),
++ * bitOffset/bitWidth, lsb/msb and bitRange field forms, enumeratedValues (incl. isDefault),
++ * readAction (registers with read side effects are never read automatically).
++ */
++
++import * as fs from 'fs';
++import { XMLParser } from 'fast-xml-parser';
++
++export type SvdAccess = 'read-only' | 'write-only' | 'read-write' | 'writeOnce' | 'read-writeOnce';
++
++export interface SvdEnumValue {
++    name: string;
++    description?: string;
++    value?: bigint;          // undefined when isDefault
++    isDefault?: boolean;
++}
++
++export interface SvdField {
++    kind: 'field';
++    id: number;
++    name: string;
++    description?: string;
++    bitOffset: number;
++    bitWidth: number;
++    access: SvdAccess;
++    enums: SvdEnumValue[];
++    parent: SvdRegister;
++}
++
++export interface SvdRegister {
++    kind: 'register';
++    id: number;
++    name: string;
++    description?: string;
++    address: number;         // absolute
++    size: number;            // bits
++    access: SvdAccess;
++    resetValue?: bigint;
++    readAction?: string;
++    fields: SvdField[];
++    peripheral: SvdPeripheral;
++}
++
++export interface SvdCluster {
++    kind: 'cluster';
++    id: number;
++    name: string;
++    description?: string;
++    address: number;         // absolute
++    children: (SvdCluster | SvdRegister)[];
++    peripheral: SvdPeripheral;
++}
++
++export interface SvdPeripheral {
++    kind: 'peripheral';
++    id: number;
++    name: string;
++    description?: string;
++    groupName?: string;
++    baseAddress: number;
++    children: (SvdCluster | SvdRegister)[];
++}
++
++export type SvdNode = SvdPeripheral | SvdCluster | SvdRegister | SvdField;
++
++export interface SvdDevice {
++    name: string;
++    littleEndian: boolean;
++    peripherals: SvdPeripheral[];
++    nodes: SvdNode[];            // nodes[id] === node
++}
++
++interface RegProps {
++    size: number;
++    access: SvdAccess;
++    resetValue?: bigint;
++}
++
++// ---------------------------------------------------------------------------
++
++export function parseSvdNumber(v: any): bigint | undefined {
++    if (v === undefined || v === null) {
++        return undefined;
++    }
++    let s = String(v).trim().toLowerCase();
++    if (!s) {
++        return undefined;
++    }
++    try {
++        if (s.startsWith('#')) {
++            s = s.substring(1).replace(/x/g, '0');       // binary, 'x' = don't care
++            return BigInt('0b' + s);
++        }
++        if (s.startsWith('0b')) {
++            return BigInt('0b' + s.substring(2).replace(/x/g, '0'));
++        }
++        if (s.startsWith('0x')) {
++            return BigInt(s);
++        }
++        if (/^[0-9]+$/.test(s)) {
++            return BigInt(s);
++        }
++    } catch {
++        // fall through
++    }
++    return undefined;
++}
++
++function num(v: any, def?: number): number | undefined {
++    const b = parseSvdNumber(v);
++    return b === undefined ? def : Number(b);
++}
++
++function text(v: any): string | undefined {
++    if (v === undefined || v === null) {
++        return undefined;
++    }
++    if (typeof v === 'object') {
++        v = v['#text'];
++        if (v === undefined) {
++            return undefined;
++        }
++    }
++    const s = String(v).replace(/\s+/g, ' ').trim();
++    return s || undefined;
++}
++
++function asArray<T>(v: T | T[] | undefined): T[] {
++    if (v === undefined || v === null) {
++        return [];
++    }
++    return Array.isArray(v) ? v : [v];
++}
++
++function normAccess(a: any, def: SvdAccess): SvdAccess {
++    const s = text(a);
++    switch (s) {
++        case 'read-only':
++        case 'write-only':
++        case 'read-write':
++        case 'writeOnce':
++        case 'read-writeOnce':
++            return s;
++        default:
++            return def;
++    }
++}
++
++function mergeProps(parent: RegProps, x: any): RegProps {
++    return {
++        size: num(x?.size, parent.size),
++        access: normAccess(x?.access, parent.access),
++        resetValue: parseSvdNumber(x?.resetValue) ?? parent.resetValue
++    };
++}
++
++/** Expands the dim specification of an element into [name, offset] pairs */
++function expandDim(x: any, baseName: string): { name: string; offset: number }[] {
++    const dim = num(x.dim);
++    if (!dim) {
++        return [{ name: baseName.replace(/\[%s\]|%s/g, ''), offset: 0 }];
++    }
++    const inc = num(x.dimIncrement, 0);
++    let indices: string[] = [];
++    const di = text(x.dimIndex);
++    if (di) {
++        const range = /^(\d+)\s*-\s*(\d+)$/.exec(di);
++        const letters = /^([A-Za-z])\s*-\s*([A-Za-z])$/.exec(di);
++        if (range) {
++            for (let i = parseInt(range[1]); i <= parseInt(range[2]); i++) {
++                indices.push(String(i));
++            }
++        } else if (letters) {
++            for (let c = letters[1].charCodeAt(0); c <= letters[2].charCodeAt(0); c++) {
++                indices.push(String.fromCharCode(c));
++            }
++        } else {
++            indices = di.split(',').map((s) => s.trim());
++        }
++    }
++    const out: { name: string; offset: number }[] = [];
++    for (let i = 0; i < dim; i++) {
++        const idx = indices[i] ?? String(i);
++        let name: string;
++        if (baseName.includes('[%s]')) {
++            name = baseName.replace('[%s]', `[${idx}]`);
++        } else if (baseName.includes('%s')) {
++            name = baseName.replace('%s', idx);
++        } else {
++            name = `${baseName}${idx}`;
++        }
++        out.push({ name, offset: i * inc });
++    }
++    return out;
++}
++
++// ---------------------------------------------------------------------------
++
++class Builder {
++    public nodes: SvdNode[] = [];
++
++    private add<T extends SvdNode>(n: Omit<T, 'id'>): T {
++        const node = n as T;
++        node.id = this.nodes.length;
++        this.nodes.push(node);
++        return node;
++    }
++
++    private parseFields(xreg: any, reg: SvdRegister) {
++        const xfields = asArray(xreg.fields?.field);
++        const byName = new Map<string, any>();
++        for (const xf of xfields) {
++            const n = text(xf.name);
++            if (n) {
++                byName.set(n, xf);
++            }
++        }
++        for (let xf of xfields) {
++            const derived = text(xf['@_derivedFrom']);
++            if (derived && byName.has(derived)) {
++                xf = Object.assign({}, byName.get(derived), xf);
++            }
++            const baseName = text(xf.name);
++            if (!baseName) {
++                continue;
++            }
++            let bitOffset: number | undefined;
++            let bitWidth: number | undefined;
++            if (xf.bitOffset !== undefined) {
++                bitOffset = num(xf.bitOffset);
++                bitWidth = num(xf.bitWidth, 1);
++            } else if (xf.lsb !== undefined) {
++                bitOffset = num(xf.lsb);
++                bitWidth = num(xf.msb) - bitOffset + 1;
++            } else if (xf.bitRange !== undefined) {
++                const m = /\[\s*(\d+)\s*:\s*(\d+)\s*\]/.exec(text(xf.bitRange) || '');
++                if (m) {
++                    bitOffset = parseInt(m[2]);
++                    bitWidth = parseInt(m[1]) - bitOffset + 1;
++                }
++            }
++            if (bitOffset === undefined || !bitWidth || bitWidth < 1) {
++                continue;
++            }
++            const enums: SvdEnumValue[] = [];
++            for (const ev of asArray(xf.enumeratedValues)) {
++                const usage = text((ev).usage);
++                if (usage === 'write') {
++                    continue;
++                }
++                for (const e of asArray((ev).enumeratedValue)) {
++                    const name = text((e).name);
++                    if (!name) {
++                        continue;
++                    }
++                    const isDefault = text((e).isDefault) === 'true';
++                    enums.push({ name, description: text((e).description), value: parseSvdNumber((e).value), isDefault });
++                }
++            }
++            for (const { name, offset } of expandDim(xf, baseName)) {
++                const field = this.add<SvdField>({
++                    kind: 'field', name, description: text(xf.description),
++                    bitOffset: bitOffset + offset, bitWidth, access: normAccess(xf.access, reg.access), enums, parent: reg
++                });
++                reg.fields.push(field);
++            }
++        }
++        reg.fields.sort((a, b) => b.bitOffset - a.bitOffset);
++    }
++
++    private parseRegister(xreg: any, base: number, props: RegProps, periph: SvdPeripheral, out: (SvdCluster | SvdRegister)[]) {
++        const baseName = text(xreg.name);
++        if (!baseName) {
++            return;
++        }
++        const p = mergeProps(props, xreg);
++        const off = num(xreg.addressOffset, 0);
++        for (const { name, offset } of expandDim(xreg, baseName)) {
++            const reg = this.add<SvdRegister>({
++                kind: 'register', name, description: text(xreg.description),
++                address: base + off + offset, size: p.size, access: p.access, resetValue: p.resetValue,
++                readAction: text(xreg.readAction), fields: [], peripheral: periph
++            });
++            this.parseFields(xreg, reg);
++            out.push(reg);
++        }
++    }
++
++    private parseChildren(xparent: any, base: number, props: RegProps, periph: SvdPeripheral, out: (SvdCluster | SvdRegister)[]) {
++        const regs = xparent?.registers ?? xparent;     // peripherals wrap in <registers>, clusters don't
++        if (!regs) {
++            return;
++        }
++        // Resolve derivedFrom among siblings by name
++        const siblings = new Map<string, any>();
++        for (const x of [...asArray(regs.register), ...asArray(regs.cluster)]) {
++            const n = text((x).name);
++            if (n) {
++                siblings.set(n, x);
++            }
++        }
++        const resolve = (x: any) => {
++            const d = text(x['@_derivedFrom']);
++            if (d && siblings.has(d)) {
++                return Object.assign({}, siblings.get(d), x);
++            }
++            return x;
++        };
++        for (const xc of asArray(regs.cluster)) {
++            const c = resolve(xc);
++            const baseName = text(c.name);
++            if (!baseName) {
++                continue;
++            }
++            const p = mergeProps(props, c);
++            const off = num(c.addressOffset, 0);
++            for (const { name, offset } of expandDim(c, baseName)) {
++                const cluster = this.add<SvdCluster>({
++                    kind: 'cluster', name, description: text(c.description),
++                    address: base + off + offset, children: [], peripheral: periph
++                });
++                this.parseChildren(c, cluster.address, p, periph, cluster.children);
++                out.push(cluster);
++            }
++        }
++        for (const xr of asArray(regs.register)) {
++            this.parseRegister(resolve(xr), base, props, periph, out);
++        }
++        out.sort((a, b) => a.address - b.address);
++    }
++
++    public build(xml: string): SvdDevice {
++        const parser = new XMLParser({
++            ignoreAttributes: false,
++            attributeNamePrefix: '@_',
++            parseTagValue: false,          // keep numbers as strings; we parse SVD number formats ourselves
++            trimValues: true,
++            isArray: (tag) => ['peripheral', 'register', 'cluster', 'field', 'enumeratedValue', 'enumeratedValues'].includes(tag)
++        });
++        const doc = parser.parse(xml);
++        const dev = doc.device;
++        if (!dev) {
++            throw new Error('not an SVD file (no <device> element)');
++        }
++        const devProps: RegProps = {
++            size: num(dev.size, 32),
++            access: normAccess(dev.access, 'read-write'),
++            resetValue: parseSvdNumber(dev.resetValue)
++        };
++        const xperiphs = asArray(dev.peripherals?.peripheral);
++        const byName = new Map<string, any>();
++        for (const xp of xperiphs) {
++            const n = text(xp.name);
++            if (n) {
++                byName.set(n, xp);
++            }
++        }
++        const peripherals: SvdPeripheral[] = [];
++        for (const xp0 of xperiphs) {
++            let xp = xp0;
++            const derived = text(xp['@_derivedFrom']);
++            if (derived && byName.has(derived)) {
++                const base = byName.get(derived);
++                xp = Object.assign({}, base, xp);
++                if (!xp0.registers) {
++                    xp.registers = base.registers;
++                }
++            }
++            const baseName = text(xp.name);
++            if (!baseName) {
++                continue;
++            }
++            const props = mergeProps(devProps, xp);
++            const baseAddress = num(xp.baseAddress, 0);
++            for (const { name, offset } of expandDim(xp, baseName)) {
++                const periph = this.add<SvdPeripheral>({
++                    kind: 'peripheral', name, description: text(xp.description), groupName: text(xp.groupName),
++                    baseAddress: baseAddress + offset, children: []
++                });
++                this.parseChildren(xp, periph.baseAddress, props, periph, periph.children);
++                peripherals.push(periph);
++            }
++        }
++        peripherals.sort((a, b) => a.name.localeCompare(b.name));
++        const endian = text(dev.cpu?.endian);
++        return { name: text(dev.name) || 'device', littleEndian: endian !== 'big', peripherals, nodes: this.nodes };
++    }
++}
++
++export function loadSvd(file: string): SvdDevice {
++    return new Builder().build(fs.readFileSync(file, 'utf8'));
++}
++
++export function parseSvd(xml: string): SvdDevice {
++    return new Builder().build(xml);
++}
++
++/** All registers below a peripheral or cluster, depth first */
++export function registersOf(node: SvdPeripheral | SvdCluster): SvdRegister[] {
++    const out: SvdRegister[] = [];
++    const walk = (children: (SvdCluster | SvdRegister)[]) => {
++        for (const c of children) {
++            if (c.kind === 'register') {
++                out.push(c);
++            } else {
++                walk(c.children);
++            }
++        }
++    };
++    walk(node.children);
++    return out;
++}
++
++export function isReadable(reg: SvdRegister): boolean {
++    return reg.access !== 'write-only' && !reg.readAction;
++}
++
++export function isWritable(access: SvdAccess): boolean {
++    return access !== 'read-only';
++}
+-- 
+2.43.0
+

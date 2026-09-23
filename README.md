@@ -6,7 +6,7 @@ It supports J-Link, OpenOCD, pyOCD, ST-Link, Black Magic Probe and QEMU.
 
 [Русская версия](README.ru.md)
 
-> **Status: experimental (v0.1.0).** An end-to-end debug session has been
+> **Status: experimental (v0.2.0).** An end-to-end debug session has been
 > tested on Linux against QEMU (Cortex-M3). It has not yet been tested on
 > real hardware or inside a running Zed instance on every platform. The
 > primary target is **J-Link on Windows**. Bug reports are very welcome.
@@ -22,6 +22,7 @@ Cortex-Debug authors or with Zed Industries.
 - Breakpoints: line, conditional, hit-count, logpoints and function breakpoints; data watchpoints
 - Stepping: over, into and out, instruction-level stepping, pause
 - Call stack; **Local / Global / Static / Registers** scopes; watch expressions; hover evaluation
+- **Peripheral registers from an SVD file**: peripherals, registers and bit fields with enum names in the Variables panel; values can be edited ([details](#peripheral-registers-svd))
 - **Debug Console works as a GDB console**: `monitor reset`, `monitor halt`,
   `x/8wx 0x20000000`, `info registers`, `p/x *(uint32_t*)0x40020000`…
 - gdb-server and semihosting output in the Debug Console (or in a log file)
@@ -37,11 +38,9 @@ Cortex-Debug authors or with Zed Industries.
 Zed does not yet let extensions add custom panels, so the following
 Cortex-Debug UI features are missing:
 
-- Peripheral (SVD) viewer, RTOS viewer, Memory viewer
+- RTOS viewer, Memory viewer (the Cortex-Debug webview panels)
 - SWO/RTT graphs and decoders UI, Live Watch panel
 - Multi-core / chained sessions (`chainedConfigurations`)
-
-Peripheral registers can still be read from the Debug Console (see the examples above).
 
 ## Requirements
 
@@ -80,6 +79,7 @@ Minimal `.zed/debug.json` for J-Link:
     "device": "STM32F407VG",
     "interface": "swd",
     "executable": "build/firmware.elf",
+    "svdFile": "STM32F407.svd",
     "runToEntryPoint": "main"
   }
 ]
@@ -105,6 +105,42 @@ Zed-specific options:
 |---|---|---|
 | `gdbServerOutput` | `"console"` | Where gdb-server output goes: `"console"`, `"none"` or a log file path |
 | `nodePath` | Zed's Node.js | Path to a different `node` executable to run the adapter |
+| `svdAddrGapThreshold` | `16` | Registers closer than this many bytes are read in one transfer; `0` reads each register separately |
+
+### Peripheral registers (SVD)
+
+Set `svdFile` to your device's CMSIS-SVD file. You can get SVD files from the
+vendor's device pack, from the STM32CubeIDE installation, or from
+[cmsis-svd-data](https://github.com/cmsis-svd/cmsis-svd-data).
+A **Peripherals** scope then appears in the Variables panel:
+
+```
+Peripherals (STM32F407)
+├─ GPIOA          0x40020000  General-purpose I/Os
+│  ├─ MODER       0xA8000000        rw u32 @ 0x40020000
+│  │  ├─ MODER15  Alternate = 0x2 (2)   rw [31:30]
+│  │  └─ …
+│  └─ ODR         0x00000020
+└─ USART1 …
+```
+
+- **Values are read only when you expand a node.** Expanding a peripheral
+  reads its registers in a few grouped memory transfers. Values are cached
+  until the target runs, steps or you type a command in the Debug Console.
+- **You can edit registers and fields.** Edit a value in the Variables panel.
+  Registers accept `0x…`, decimal, `0b…` or `#…`. Fields also accept an enum
+  name such as `Alternate`. A field write is a read-modify-write of its
+  register, and the value is read back from the hardware afterwards.
+- **Some registers are never read automatically.** Registers with a
+  `readAction` in the SVD (read has side effects, e.g. clear-on-read) and
+  write-only registers are skipped. Keep in mind that expanding a peripheral
+  such as a UART still reads all of its registers. This includes data
+  registers whose read side effects the SVD does not declare, just like any
+  memory viewer.
+- **Registers can go to Watch.** Each register has an evaluate name such as
+  `*(volatile unsigned int *)0x40020000`, so you can add it to Watch.
+- **Supported SVD features:** `derivedFrom`, `dim` arrays and clusters,
+  property inheritance, all three bit-range notations and enumerated values.
 
 ### Other gdb-servers
 
@@ -151,6 +187,9 @@ The shim fills in defaults and validates each `servertype`. It also locates
 J-Link, makes paths absolute, and forwards gdb-server output to Zed as DAP
 `output` events. It drops VS Code-specific custom events and turns useful ones,
 such as error pop-ups and RTT ports, into console messages.
+`src/zed/svd.ts` and `src/zed/peripherals.ts` parse the SVD file and serve
+it through the standard DAP `scopes`, `variables` and `setVariable`
+requests. The peripheral viewer therefore needs no custom UI in Zed.
 
 The Rust part ([`src/lib.rs`](src/lib.rs)) embeds the bundled adapter and
 unpacks it into the extension's work directory on first use. It then starts
@@ -170,7 +209,9 @@ src/lib.rs                the Zed extension (Rust → wasm32-wasip2)
 
 ### Changes to Cortex-Debug (`patches/`)
 
-1. Adds `src/zed/adapter.ts`, the headless replacement for the VS Code frontend.
+1. Adds `src/zed/adapter.ts`, the headless replacement for the VS Code frontend,
+   and `src/zed/svd.ts` + `src/zed/peripherals.ts`, the SVD peripheral scope.
+   Adds the `fast-xml-parser` dependency.
 2. Moves the session start-up from `gdb.ts` to `src/debugadapter-main.ts` so
    that `GDBDebugSession` can be imported without side effects. The VS Code
    build is unaffected.
@@ -202,7 +243,7 @@ checkout instead of the embedded copy:
 - [ ] Verify on Windows with J-Link hardware
 - [ ] Publish to the Zed extension registry
 - [ ] Debug locator: start debugging directly from CMake/Make tasks
-- [ ] SVD peripheral registers exposed as a variables scope
+- [x] SVD peripheral registers exposed as a variables scope
 - [ ] Upstream the Zed entry point and the MI fix to Cortex-Debug
 
 ## Credits and license
