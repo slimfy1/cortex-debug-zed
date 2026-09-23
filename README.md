@@ -6,8 +6,9 @@ It supports J-Link, OpenOCD, pyOCD, ST-Link, Black Magic Probe and QEMU.
 
 [Русская версия](README.ru.md)
 
-> **Status: experimental (v0.2.0).** An end-to-end debug session has been
-> tested on Linux against QEMU (Cortex-M3). It has not yet been tested on
+> **Status: experimental (v0.3.0).** End-to-end debug sessions have been
+> tested on Linux against QEMU (Cortex-M3), including the SVD peripheral
+> view, the FreeRTOS task view and the memory view. It has not yet been tested on
 > real hardware or inside a running Zed instance on every platform. The
 > primary target is **J-Link on Windows**. Bug reports are very welcome.
 
@@ -23,10 +24,12 @@ Cortex-Debug authors or with Zed Industries.
 - Stepping: over, into and out, instruction-level stepping, pause
 - Call stack; **Local / Global / Static / Registers** scopes; watch expressions; hover evaluation
 - **Peripheral registers from an SVD file**: peripherals, registers and bit fields with enum names in the Variables panel; values can be edited ([details](#peripheral-registers-svd))
+- **FreeRTOS task view**: all tasks with state, priority, stack high-water mark and CPU share ([details](#rtos-task-view-freertos))
+- **Memory view**: Zed's built-in hex viewer and editor, with "Go To Memory" on variables, registers and tasks ([details](#memory-view))
 - **Debug Console works as a GDB console**: `monitor reset`, `monitor halt`,
   `x/8wx 0x20000000`, `info registers`, `p/x *(uint32_t*)0x40020000`…
 - gdb-server and semihosting output in the Debug Console (or in a log file)
-- RTOS thread awareness, where the gdb-server supports it (J-Link: FreeRTOS, embOS, Zephyr, …)
+- RTOS threads in the call stack, where the gdb-server supports it (`"rtos"`; J-Link: FreeRTOS, embOS, Zephyr, …)
 - RTT: the TCP port for each channel is printed at session start, so you can
   read it with PuTTY (Raw), `telnet` or `nc`
 - Auto-detects `JLinkGDBServerCL.exe` in `C:\Program Files\SEGGER\JLink*`
@@ -38,9 +41,11 @@ Cortex-Debug authors or with Zed Industries.
 Zed does not yet let extensions add custom panels, so the following
 Cortex-Debug UI features are missing:
 
-- RTOS viewer, Memory viewer (the Cortex-Debug webview panels)
 - SWO/RTT graphs and decoders UI, Live Watch panel
 - Multi-core / chained sessions (`chainedConfigurations`)
+- The RTOS task view for kernels other than FreeRTOS (Zephyr, embOS,
+  ThreadX, µC/OS). Per-thread call stacks still work through the
+  gdb-server's `"rtos"` option.
 
 ## Requirements
 
@@ -105,6 +110,7 @@ Zed-specific options:
 |---|---|---|
 | `gdbServerOutput` | `"console"` | Where gdb-server output goes: `"console"`, `"none"` or a log file path |
 | `nodePath` | Zed's Node.js | Path to a different `node` executable to run the adapter |
+| `rtosView` | `true` | Show the FreeRTOS task view when FreeRTOS symbols are found |
 | `svdAddrGapThreshold` | `16` | Registers closer than this many bytes are read in one transfer; `0` reads each register separately |
 
 ### Peripheral registers (SVD)
@@ -141,6 +147,57 @@ Peripherals (STM32F407)
   `*(volatile unsigned int *)0x40020000`, so you can add it to Watch.
 - **Supported SVD features:** `derivedFrom`, `dim` arrays and clusters,
   property inheritance, all three bit-range notations and enumerated values.
+
+### RTOS task view (FreeRTOS)
+
+If the program contains FreeRTOS, an **RTOS (FreeRTOS)** scope appears in the
+Variables panel automatically. No configuration is needed:
+
+```
+RTOS (FreeRTOS)
+├─ Blinker   Blocked · prio 1 · stack free 412 B
+├─ Sensor    Ready · prio 2 · stack free 580 B
+├─ Waiter    Running · prio 3 · stack free 352 B
+│  ├─ Stack start (pxStack)        0x20000858
+│  ├─ Stack size                   508 B
+│  ├─ Stack free (high-water mark) 352 B
+│  └─ TCB                          0x20000a60
+├─ Sleeper   Suspended · prio 1 · stack free 292 B
+└─ IDLE      Ready · prio 0 · stack free 436 B
+```
+
+- **Task data comes from the kernel's own lists.** The view reads the ready,
+  delayed, pending, suspended and deleted lists through ordinary GDB
+  expressions, so it works with any gdb-server and with GDB builds that
+  have no Python.
+- **Stack free** is the high-water mark: the bytes still holding the `0xA5`
+  fill pattern. **Stack size** and **Stack used now** need
+  `configRECORD_STACK_HIGH_ADDRESS 1`. **CPU %** needs
+  `configGENERATE_RUN_TIME_STATS 1`.
+- **Addresses open in the Memory View.** Right-click a task, its TCB or its
+  stack address and choose **Go To Memory**.
+- **Per-task call stacks** are a separate feature. For those, also set
+  `"rtos": "FreeRTOS"` (J-Link, OpenOCD or pyOCD). The gdb-server then
+  reports each task as a thread in Zed's Frames list.
+- The kernel must be built with debug info (it usually is). Set
+  `"rtosView": false` to turn the view off.
+
+### Memory view
+
+Zed has a built-in **Memory View** pane in the debug panel. If it is hidden,
+add it from the pane's `+` menu. This adapter makes it work well on
+microcontrollers:
+
+- **Jump to an address or an expression.** Type an address (`0x20000000`) or
+  an expression (`&rxBuffer`, `huart1.pRxBuffPtr`, `pxCurrentTCB`) in the
+  address bar. Pointers jump to the memory they point to, other values to
+  their own address.
+- **Go To Memory** is available on local and global variables, watch
+  expressions, SVD registers and RTOS tasks.
+- **Reserved address space shows as unreadable** instead of blanking the
+  whole 4 KiB page. For example, the end of flash and the gap before the
+  next region are displayed correctly.
+- **Memory can be edited in place.** Edits are written to the target.
 
 ### Other gdb-servers
 
@@ -190,6 +247,10 @@ such as error pop-ups and RTT ports, into console messages.
 `src/zed/svd.ts` and `src/zed/peripherals.ts` parse the SVD file and serve
 it through the standard DAP `scopes`, `variables` and `setVariable`
 requests. The peripheral viewer therefore needs no custom UI in Zed.
+`src/zed/rtos.ts` does the same for FreeRTOS tasks. `src/zed/memory.ts`
+implements partial `readMemory` responses (`unreadableBytes`), resolves the
+Memory View's address-bar expressions and attaches a `memoryReference` to
+variables and watch results.
 
 The Rust part ([`src/lib.rs`](src/lib.rs)) embeds the bundled adapter and
 unpacks it into the extension's work directory on first use. It then starts
@@ -210,8 +271,9 @@ src/lib.rs                the Zed extension (Rust → wasm32-wasip2)
 ### Changes to Cortex-Debug (`patches/`)
 
 1. Adds `src/zed/adapter.ts`, the headless replacement for the VS Code frontend,
-   and `src/zed/svd.ts` + `src/zed/peripherals.ts`, the SVD peripheral scope.
-   Adds the `fast-xml-parser` dependency.
+   with its Zed-only features: `svd.ts` + `peripherals.ts` (SVD peripheral
+   scope), `rtos.ts` (FreeRTOS task view) and `memory.ts` (Memory View
+   support). Adds the `fast-xml-parser` dependency.
 2. Moves the session start-up from `gdb.ts` to `src/debugadapter-main.ts` so
    that `GDBDebugSession` can be imported without side effects. The VS Code
    build is unaffected.
@@ -244,6 +306,8 @@ checkout instead of the embedded copy:
 - [ ] Publish to the Zed extension registry
 - [ ] Debug locator: start debugging directly from CMake/Make tasks
 - [x] SVD peripheral registers exposed as a variables scope
+- [x] FreeRTOS task view; Memory View support
+- [ ] RTOS task view for Zephyr, embOS, ThreadX, µC/OS
 - [ ] Upstream the Zed entry point and the MI fix to Cortex-Debug
 
 ## Credits and license

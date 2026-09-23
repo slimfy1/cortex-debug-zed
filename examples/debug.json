@@ -14,6 +14,10 @@
     // Optional: peripheral registers in the Variables panel ("Peripherals" scope)
     "svdFile": "STM32F407.svd",
 
+    // Optional: per-task call stacks via the J-Link RTOS plugin
+    // (the "RTOS (FreeRTOS)" task view in Variables works without this)
+    // "rtos": "FreeRTOS",
+
     // Optional: only needed if the tools are not on PATH / not auto-detected
     // "serverpath": "C:/Program Files/SEGGER/JLink/JLinkGDBServerCL.exe",
     // "armToolchainPath": "C:/Program Files (x86)/Arm GNU Toolchain arm-none-eabi/14.2 rel1/bin",

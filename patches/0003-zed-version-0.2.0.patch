@@ -1,7 +1,7 @@
 From 85da17487393aae3a7fed6da18167cc7be5fc7c5 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 23 Sep 2026 23:30:25 +0300
-Subject: [PATCH 3/3] zed: version 0.2.0
+Subject: [PATCH 3/4] zed: version 0.2.0
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01UStNUDdj88B9YWgFcwipyi

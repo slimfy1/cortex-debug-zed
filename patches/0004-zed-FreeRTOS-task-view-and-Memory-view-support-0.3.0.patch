@@ -1,0 +1,713 @@
+From e875786f5bc6abb8a720d80036582579014e1bb7 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 23 Sep 2026 23:47:27 +0300
+Subject: [PATCH 4/4] zed: FreeRTOS task view and Memory view support (0.3.0)
+
+- src/zed/rtos.ts: walks FreeRTOS kernel lists via GDB expressions and
+  shows tasks (state, priority, stack high-water mark, run time) as an
+  "RTOS (FreeRTOS)" variables scope
+- src/zed/memory.ts + adapter.ts: readMemory returns the readable prefix
+  plus unreadableBytes instead of failing whole pages; resolve Zed Memory
+  view address-bar expressions (?${expr}); add memoryReference to
+  variables and watch results so "Go to Memory" works
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UStNUDdj88B9YWgFcwipyi
+---
+ src/zed/adapter.ts | 186 +++++++++++++++++++++++++-
+ src/zed/memory.ts  |  99 ++++++++++++++
+ src/zed/rtos.ts    | 321 +++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 599 insertions(+), 7 deletions(-)
+ create mode 100644 src/zed/memory.ts
+ create mode 100644 src/zed/rtos.ts
+
+diff --git a/src/zed/adapter.ts b/src/zed/adapter.ts
+index 937ca3d..00b4a56 100644
+--- a/src/zed/adapter.ts
++++ b/src/zed/adapter.ts
+@@ -29,10 +29,12 @@ import { GDBDebugSession } from '../gdb';
+ import { ServerConsoleLog } from '../backend/server';
+ import { loadSvd } from './svd';
+ import { PeripheralProvider } from './peripherals';
++import { FreeRtosProvider } from './rtos';
++import { hexAddr, parseAddress, readPartial } from './memory';
+ import { ADAPTER_DEBUG_MODE, ConfigurationArguments, defSymbolFile, sanitizeDevDebug, SymbolFile, validateELFHeader } from '../common';
+ 
+ // Version of this Zed port; bump together with zed-extension/extension.toml
+-const ZED_ADAPTER_VERSION = '0.2.0';
++const ZED_ADAPTER_VERSION = '0.3.0';
+ 
+ // Directory that contains `dist/` and `support/` (gdbsupport.init etc.)
+ // The bundle lives at <root>/dist/zedadapter.js
+@@ -476,6 +478,49 @@ class ServerConsole {
+ export class ZedCortexDebugSession extends GDBDebugSession {
+     private serverConsole: ServerConsole | null = null;
+     private periph: PeripheralProvider | null = null;
++    private rtos: FreeRtosProvider | null = null;
++    /** request_seq -> expression of pending 'watch' evaluations (to attach a memoryReference) */
++    private watchExprs = new Map<number, string>();
++
++    // ---- small GDB/MI helpers used by the Zed-only features ----
++
++    private async miEvaluate(expr: string): Promise<string> {
++        const quoted = '"' + expr.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
++        const node = await this.miDebugger.sendCommand(`data-evaluate-expression ${quoted}`);
++        const value = node.result('value');
++        if (typeof value !== 'string') {
++            throw new Error('no value');
++        }
++        return value;
++    }
++
++    private async miRead(address: number, length: number): Promise<string> {
++        const node = await this.miDebugger.sendCommand(`data-read-memory-bytes 0x${address.toString(16)} ${length}`);
++        const contents = node.result('memory[0].contents');
++        if (typeof contents !== 'string') {
++            throw new Error('no data');
++        }
++        return contents;
++    }
++
++    /** Address of an lvalue expression, or the value of a pointer expression */
++    private async addressOf(expr: string): Promise<number | undefined> {
++        try {
++            return parseAddress(await this.miEvaluate(`&(${expr})`));
++        } catch {
++            try {
++                const v = await this.miEvaluate(expr);
++                return /^(\([^)]*\*\)\s*)?0x[0-9a-fA-F]+/.test(v) ? parseAddress(v) : undefined;
++            } catch {
++                return undefined;
++            }
++        }
++    }
++
++    private invalidateTargetCaches() {
++        this.periph?.invalidate();
++        this.rtos?.invalidate();
++    }
+ 
+     /** Loads "svdFile" (if any) and sets up the Peripherals scope */
+     private setupPeripherals(cfg: any) {
+@@ -535,6 +580,10 @@ export class ZedCortexDebugSession extends GDBDebugSession {
+             mode = { file: path.isAbsolute(opt) ? opt : path.join(cfg.cwd, opt) };
+         }
+         this.setupPeripherals(cfg);
++        this.rtos = (cfg.rtosView === false) ? null : new FreeRtosProvider({
++            evaluate: (e) => this.miEvaluate(e),
++            read: (a, n) => this.miRead(a, n)
++        });
+ 
+         this.serverConsole = new ServerConsole(mode, (text) => this.out(text, 'stdout'));
+         this.serverConsole.start().then((port) => {
+@@ -562,17 +611,71 @@ export class ZedCortexDebugSession extends GDBDebugSession {
+     // ---- SVD peripherals exposed as a variables scope ----
+ 
+     public sendResponse(response: DebugProtocol.Response): void {
+-        if (this.periph && response.command === 'scopes' && response.success) {
++        if (response.success && ['scopes', 'variables', 'evaluate'].includes(response.command)) {
++            // Post-process asynchronously; DAP responses are matched by request_seq, not order
++            this.decorateResponse(response).catch(() => undefined).finally(() => super.sendResponse(response));
++            return;
++        }
++        this.watchExprs.delete(response.request_seq);
++        super.sendResponse(response);
++    }
++
++    private async decorateResponse(response: DebugProtocol.Response): Promise<void> {
++        if (response.command === 'scopes') {
+             const scopes = (response as DebugProtocol.ScopesResponse).body?.scopes;
+             // cortex-debug returns no scopes while the target is running; only add ours when stopped
+             if (scopes && scopes.length > 0) {
+-                scopes.push(this.periph.scope());
++                if (this.rtos && await this.rtos.detect()) {
++                    scopes.push(this.rtos.scope());
++                }
++                if (this.periph) {
++                    scopes.push(this.periph.scope());
++                }
++            }
++        } else if (response.command === 'variables') {
++            // Give variables a memoryReference so Zed offers "Go to Memory" for them
++            const vars = (response as DebugProtocol.VariablesResponse).body?.variables || [];
++            let budget = 200;
++            for (const v of vars) {
++                if (budget <= 0) {
++                    break;
++                }
++                if (v.memoryReference || !v.evaluateName || v.evaluateName.startsWith('$')) {
++                    continue;
++                }
++                budget--;
++                const a = await this.addressOf(v.evaluateName);
++                if (a !== undefined) {
++                    v.memoryReference = hexAddr(a);
++                }
++            }
++        } else if (response.command === 'evaluate') {
++            const expr = this.watchExprs.get(response.request_seq);
++            this.watchExprs.delete(response.request_seq);
++            const body = (response as DebugProtocol.EvaluateResponse).body;
++            if (expr && body && !body.memoryReference) {
++                const a = await this.addressOf(expr);
++                if (a !== undefined) {
++                    body.memoryReference = hexAddr(a);
++                }
+             }
+         }
+-        super.sendResponse(response);
+     }
+ 
+     protected async variablesRequest(response: DebugProtocol.VariablesResponse, args: DebugProtocol.VariablesArguments): Promise<void> {
++        if (this.rtos && FreeRtosProvider.isOurs(args.variablesReference)) {
++            response.body = { variables: [] };
++            if (this.isMIStatusStopped()) {
++                try {
++                    response.body.variables = await this.rtos.variables(args.variablesReference);
++                } catch (e) {
++                    this.sendErrorResponse(response, 1201, `RTOS: ${e instanceof Error ? e.message : e}`);
++                    return;
++                }
++            }
++            this.sendResponse(response);
++            return;
++        }
+         if (!this.periph || !PeripheralProvider.isOurs(args.variablesReference)) {
+             return super.variablesRequest(response, args);
+         }
+@@ -591,7 +694,7 @@ export class ZedCortexDebugSession extends GDBDebugSession {
+ 
+     protected async setVariableRequest(response: DebugProtocol.SetVariableResponse, args: DebugProtocol.SetVariableArguments): Promise<void> {
+         if (!this.periph || !PeripheralProvider.isOurs(args.variablesReference)) {
+-            this.periph?.invalidate();      // a variable write may alias a peripheral register
++            this.invalidateTargetCaches();      // a variable write may alias a peripheral register
+             return super.setVariableRequest(response, args);
+         }
+         if (!this.isMIStatusStopped()) {
+@@ -608,12 +711,81 @@ export class ZedCortexDebugSession extends GDBDebugSession {
+     }
+ 
+     protected evaluateRequest(response: DebugProtocol.EvaluateResponse, args: DebugProtocol.EvaluateArguments): Promise<void> {
++        // Zed's Memory view resolves what is typed in its address bar with `?${expr}`
++        const memExpr = /^\?\$\{([\s\S]*)\}$/.exec(args.expression || '');
++        if (memExpr) {
++            return this.evaluateForMemoryView(response, memExpr[1].trim());
++        }
+         if (args.context === 'repl') {
+-            this.periph?.invalidate();      // e.g. "monitor reset" or "set var ..." from the Debug Console
++            this.invalidateTargetCaches();      // e.g. "monitor reset" or "set var ..." from the Debug Console
++        } else if (args.context === 'watch' && args.expression) {
++            this.watchExprs.set(response.request_seq, args.expression);
+         }
+         return super.evaluateRequest(response, args);
+     }
+ 
++    private async evaluateForMemoryView(response: DebugProtocol.EvaluateResponse, expr: string): Promise<void> {
++        if (!this.isMIStatusStopped()) {
++            this.sendErrorResponse(response, 1301, 'Target is running');
++            return;
++        }
++        let address: number | undefined;
++        if (/^(0x[0-9a-f]+|\d+)$/i.test(expr)) {
++            address = parseAddress(expr);
++        } else {
++            // A pointer or array/function name means "what it points to"; otherwise use its address
++            try {
++                const v = await this.miEvaluate(expr);
++                if (/^(\([^)]*\*\)\s*)?0x[0-9a-fA-F]+/.test(v)) {
++                    address = parseAddress(v);
++                }
++            } catch {
++                // not evaluable as an rvalue; try as lvalue below
++            }
++            if (address === undefined) {
++                address = await this.addressOf(expr);
++            }
++        }
++        if (address === undefined) {
++            this.sendErrorResponse(response, 1302, `Cannot resolve "${expr}" to an address`);
++            return;
++        }
++        response.body = { result: hexAddr(address), variablesReference: 0, memoryReference: hexAddr(address) };
++        super.sendResponse(response);
++    }
++
++    /**
++     * Memory reads for Zed's Memory view. Unlike the stock implementation this returns the
++     * readable prefix plus `unreadableBytes` instead of failing a whole page that touches
++     * reserved address space.
++     */
++    protected async readMemoryRequest(response: DebugProtocol.ReadMemoryResponse, args: DebugProtocol.ReadMemoryArguments): Promise<void> {
++        if (!this.isMIStatusStopped()) {
++            return super.readMemoryRequest(response, args);     // produces the stock "busy" error
++        }
++        const base = parseAddress(args.memoryReference);
++        if (base === undefined) {
++            this.sendErrorResponse(response, 1401, `Invalid memoryReference "${args.memoryReference}"`);
++            return;
++        }
++        const address = base + (args.offset || 0);
++        try {
++            const r = await readPartial({ read: (a, n) => this.miRead(a, n) }, address, args.count);
++            response.body = { address: hexAddr(address), data: r.data.toString('base64') };
++            if (r.unreadable > 0) {
++                response.body.unreadableBytes = r.unreadable;
++            }
++            super.sendResponse(response);
++        } catch (e) {
++            this.sendErrorResponse(response, 1402, `Read memory error: ${e instanceof Error ? e.message : e}`);
++        }
++    }
++
++    protected writeMemoryRequest(response: DebugProtocol.WriteMemoryResponse, args: DebugProtocol.WriteMemoryArguments): void {
++        this.invalidateTargetCaches();
++        super.writeMemoryRequest(response, args);
++    }
++
+     protected async disconnectRequest(response: DebugProtocol.DisconnectResponse, args: DebugProtocol.DisconnectArguments): Promise<void> {
+         await super.disconnectRequest(response, args);
+         // Give the adapter a moment to flush the last gdb-server output
+@@ -627,7 +799,7 @@ export class ZedCortexDebugSession extends GDBDebugSession {
+     public sendEvent(event: DebugProtocol.Event): void {
+         const name = event.event || '';
+         if (name === 'stopped' || name === 'continued') {
+-            this.periph?.invalidate();
++            this.invalidateTargetCaches();
+         }
+         if (name.startsWith('custom-')) {
+             const info = (event.body)?.info;
+diff --git a/src/zed/memory.ts b/src/zed/memory.ts
+new file mode 100644
+index 0000000..fe5d9ce
+--- /dev/null
++++ b/src/zed/memory.ts
+@@ -0,0 +1,99 @@
++/*
++ * Helpers that make Zed's built-in Memory view work well against a microcontroller.
++ *
++ * Zed reads memory one 4 KiB page at a time and relies on DAP's `unreadableBytes` to map
++ * holes. GDB fails a whole `data-read-memory-bytes` if any byte is inaccessible, which on an
++ * MCU (flash / RAM / peripheral windows separated by reserved space) would blank entire pages.
++ * `readPartial` returns the readable prefix and the size of the unreadable run that follows,
++ * so Zed can issue the next request for the rest.
++ */
++
++export interface RawMemory {
++    /** Hex string of `length` bytes at `address`, or throws if any byte is unreadable */
++    read(address: number, length: number): Promise<string>;
++}
++
++export interface PartialRead {
++    data: Buffer;             // readable bytes starting at the requested address
++    unreadable: number;       // bytes after `data` known to be unreadable (0 = none / unknown)
++}
++
++const CHUNK = 256;
++const FINE = 16;
++const MIN = 4;
++
++function hexToBuf(h: string): Buffer {
++    return Buffer.from(h, 'hex');
++}
++
++async function tryRead(mem: RawMemory, address: number, length: number): Promise<Buffer | null> {
++    try {
++        const b = hexToBuf(await mem.read(address, length));
++        return b.length === length ? b : null;
++    } catch {
++        return null;
++    }
++}
++
++/** Longest readable prefix of [address, address+length), refining down to MIN bytes */
++async function readablePrefix(mem: RawMemory, address: number, length: number): Promise<Buffer> {
++    const parts: Buffer[] = [];
++    let pos = address;
++    const end = address + length;
++    for (const step of [CHUNK, FINE, MIN]) {
++        while (pos < end) {
++            const n = Math.min(step, end - pos);
++            const b = await tryRead(mem, pos, n);
++            if (!b) {
++                break;          // refine this chunk with a smaller step
++            }
++            parts.push(b);
++            pos += n;
++        }
++        if (pos >= end) {
++            break;
++        }
++    }
++    return Buffer.concat(parts);
++}
++
++export async function readPartial(mem: RawMemory, address: number, count: number): Promise<PartialRead> {
++    if (count <= 0) {
++        return { data: Buffer.alloc(0), unreadable: 0 };
++    }
++    const whole = await tryRead(mem, address, count);
++    if (whole) {
++        return { data: whole, unreadable: 0 };
++    }
++    const data = await readablePrefix(mem, address, count);
++    // Skip over the hole: probe forward on CHUNK-aligned boundaries for the next readable byte
++    let pos = address + data.length;
++    const end = address + count;
++    let next = Math.min(end, (Math.floor(pos / CHUNK) + 1) * CHUNK);
++    // The first MIN-aligned bytes right after the prefix are unreadable by construction
++    while (next < end) {
++        if (await tryRead(mem, next, MIN)) {
++            break;
++        }
++        next = Math.min(end, next + CHUNK);
++    }
++    pos = Math.max(pos + MIN, next);
++    return { data, unreadable: Math.min(end, pos) - (address + data.length) };
++}
++
++/** Extracts the first hex address from a gdb value like "(int *) 0x20000010 <buf>" or "0x8000" */
++export function parseAddress(value: string | undefined): number | undefined {
++    if (!value) {
++        return undefined;
++    }
++    const m = /0x[0-9a-fA-F]+/.exec(value);
++    if (!m) {
++        const d = /^\s*(\d+)\s*$/.exec(value);
++        return d ? parseInt(d[1], 10) : undefined;
++    }
++    return parseInt(m[0], 16);
++}
++
++export function hexAddr(a: number): string {
++    return '0x' + a.toString(16).padStart(8, '0');
++}
+diff --git a/src/zed/rtos.ts b/src/zed/rtos.ts
+new file mode 100644
+index 0000000..9251aa2
+--- /dev/null
++++ b/src/zed/rtos.ts
+@@ -0,0 +1,321 @@
++/*
++ * RTOS task viewer for the Zed port (FreeRTOS).
++ *
++ * Walks the FreeRTOS kernel lists through ordinary GDB expressions (no Python in GDB needed)
++ * and presents the tasks as an "RTOS" scope in the Variables panel: state, priority, stack
++ * high-water mark, run-time share and the TCB/stack addresses (which open in Zed's Memory view).
++ * Requires the FreeRTOS kernel (tasks.c) to be compiled with debug info, as usual.
++ */
++
++import { DebugProtocol } from '@vscode/debugprotocol';
++import { hexAddr, parseAddress } from './memory';
++
++export const RTOS_REF_ROOT = 0x60000000;
++const RTOS_REF_LIMIT = 0x6FFFFFFF;
++
++export interface GdbAccess {
++    /** Result of `-data-evaluate-expression` (throws on error) */
++    evaluate(expr: string): Promise<string>;
++    /** Hex string of memory contents (throws on error) */
++    read(address: number, length: number): Promise<string>;
++}
++
++interface Task {
++    tcb: number;
++    name: string;
++    state: string;
++    priority?: number;
++    basePriority?: number;
++    tcbNumber?: number;
++    stackBase?: number;       // pxStack (lowest address on Cortex-M)
++    stackTop?: number;        // pxTopOfStack (saved SP; meaningless for the running task)
++    stackEnd?: number;        // pxEndOfStack (only with configRECORD_STACK_HIGH_ADDRESS)
++    stackFree?: number;       // bytes never touched (0xA5 fill), i.e. the high-water mark
++    runTime?: number;
++}
++
++interface Snapshot {
++    tasks: Task[];
++    totalRunTime?: number;
++    error?: string;
++}
++
++const STACK_FILL = 0xA5;
++const MAX_TASKS = 256;
++const MAX_STACK_SCAN = 64 * 1024;
++
++function parseIntLoose(v: string | undefined): number | undefined {
++    if (v === undefined) {
++        return undefined;
++    }
++    const m = /^\s*(?:\([^)]*\)\s*)?(-?(?:0x[0-9a-fA-F]+|\d+))/.exec(v);
++    return m ? Number(m[1]) : undefined;
++}
++
++/** Pulls `name = value` for a top-level-ish field out of gdb's struct print */
++function field(struct: string, name: string): string | undefined {
++    const re = new RegExp(`(?:^|[{,\\s])${name} = ((?:"(?:[^"\\\\]|\\\\.)*"(?:, '\\\\000' <repeats \\d+ times>)?)|[^,}\\n]+)`);
++    const m = re.exec(struct);
++    return m ? m[1].trim() : undefined;
++}
++
++function taskName(raw: string | undefined): string {
++    if (!raw) {
++        return '?';
++    }
++    const m = /^"((?:[^"\\]|\\.)*)"/.exec(raw);
++    if (m) {
++        return m[1].replace(/\\000.*$/, '') || '?';
++    }
++    return raw;
++}
++
++export class FreeRtosProvider {
++    private detected: boolean | undefined;
++    private snapshot: Snapshot | null = null;
++    private tcbType = 'TCB_t';
++
++    constructor(private gdb: GdbAccess) {}
++
++    public static isOurs(ref: number): boolean {
++        return ref >= RTOS_REF_ROOT && ref <= RTOS_REF_LIMIT;
++    }
++
++    public invalidate() {
++        this.snapshot = null;
++    }
++
++    /** true once FreeRTOS symbols are found in the program (checked once per session) */
++    public async detect(): Promise<boolean> {
++        if (this.detected !== undefined) {
++            return this.detected;
++        }
++        try {
++            await this.gdb.evaluate('&uxCurrentNumberOfTasks');
++            await this.gdb.evaluate('&pxReadyTasksLists');
++            try {
++                await this.gdb.evaluate('sizeof(TCB_t)');
++                this.tcbType = 'TCB_t';
++            } catch {
++                await this.gdb.evaluate('sizeof(tskTCB)');
++                this.tcbType = 'tskTCB';
++            }
++            this.detected = true;
++        } catch {
++            this.detected = false;
++        }
++        return this.detected;
++    }
++
++    public scope(): DebugProtocol.Scope {
++        return { name: 'RTOS (FreeRTOS)', variablesReference: RTOS_REF_ROOT, expensive: true };
++    }
++
++    private async num(expr: string): Promise<number | undefined> {
++        try {
++            return parseIntLoose(await this.gdb.evaluate(expr));
++        } catch {
++            return undefined;
++        }
++    }
++
++    private async addr(expr: string): Promise<number | undefined> {
++        try {
++            return parseAddress(await this.gdb.evaluate(expr));
++        } catch {
++            return undefined;
++        }
++    }
++
++    private async walkList(listAddr: number, state: string, into: Map<number, string>) {
++        const L = `((List_t *)${hexAddr(listAddr)})`;
++        const count = await this.num(`${L}->uxNumberOfItems`);
++        if (!count) {
++            return;
++        }
++        let item = await this.addr(`${L}->xListEnd.pxNext`);
++        for (let i = 0; i < Math.min(count, MAX_TASKS) && item; i++) {
++            const owner = await this.addr(`((ListItem_t *)${hexAddr(item)})->pvOwner`);
++            if (owner && !into.has(owner)) {
++                into.set(owner, state);
++            }
++            item = await this.addr(`((ListItem_t *)${hexAddr(item)})->pxNext`);
++        }
++    }
++
++    private async stackFree(base: number, limit: number): Promise<number | undefined> {
++        let free = 0;
++        const max = Math.min(limit, MAX_STACK_SCAN);
++        while (free < max) {
++            const n = Math.min(256, max - free);
++            let hex: string;
++            try {
++                hex = await this.gdb.read(base + free, n);
++            } catch {
++                return free > 0 ? free : undefined;
++            }
++            const buf = Buffer.from(hex, 'hex');
++            for (let i = 0; i < buf.length; i++) {
++                if (buf[i] !== STACK_FILL) {
++                    return free + i;
++                }
++            }
++            free += buf.length;
++            if (buf.length < n) {
++                break;
++            }
++        }
++        return free;
++    }
++
++    private async takeSnapshot(): Promise<Snapshot> {
++        const states = new Map<number, string>();
++        const current = await this.addr('pxCurrentTCB');
++        const prios = await this.num('sizeof(pxReadyTasksLists)/sizeof(pxReadyTasksLists[0])') ?? 0;
++        const lists: [string, string][] = [];
++        for (let p = prios - 1; p >= 0; p--) {
++            lists.push([`&pxReadyTasksLists[${p}]`, 'Ready']);
++        }
++        lists.push(
++            ['&xPendingReadyList', 'Ready'],
++            ['pxDelayedTaskList', 'Blocked'],
++            ['pxOverflowDelayedTaskList', 'Blocked'],
++            ['&xSuspendedTaskList', 'Suspended'],      // also tasks blocked with portMAX_DELAY
++            ['&xTasksWaitingTermination', 'Deleted']
++        );
++        for (const [expr, state] of lists) {
++            const a = await this.addr(expr);
++            if (a) {
++                await this.walkList(a, state, states);
++            }
++        }
++        if (current) {
++            states.set(current, 'Running');
++        }
++
++        const tasks: Task[] = [];
++        for (const [tcb, state] of states) {
++            let s: string;
++            try {
++                s = await this.gdb.evaluate(`*(${this.tcbType} *)${hexAddr(tcb)}`);
++            } catch {
++                tasks.push({ tcb, name: '?', state });
++                continue;
++            }
++            const t: Task = {
++                tcb,
++                state,
++                name: taskName(field(s, 'pcTaskName')),
++                priority: parseIntLoose(field(s, 'uxPriority')),
++                basePriority: parseIntLoose(field(s, 'uxBasePriority')),
++                tcbNumber: parseIntLoose(field(s, 'uxTCBNumber')),
++                stackBase: parseAddress(field(s, 'pxStack')),
++                stackTop: parseAddress(field(s, 'pxTopOfStack')),
++                stackEnd: parseAddress(field(s, 'pxEndOfStack')),
++                runTime: parseIntLoose(field(s, 'ulRunTimeCounter'))
++            };
++            if (t.stackBase) {
++                const limit = t.stackEnd ? t.stackEnd + 4 - t.stackBase
++                    : (t.stackTop && t.stackTop > t.stackBase ? t.stackTop - t.stackBase : MAX_STACK_SCAN);
++                t.stackFree = await this.stackFree(t.stackBase, limit);
++            }
++            tasks.push(t);
++        }
++        tasks.sort((a, b) => (a.tcbNumber ?? 1e9) - (b.tcbNumber ?? 1e9) || (b.priority ?? 0) - (a.priority ?? 0));
++        const totalRunTime = tasks.some((t) => t.runTime !== undefined) ? await this.num('ulTotalRunTime') : undefined;
++        return { tasks, totalRunTime };
++    }
++
++    private async getSnapshot(): Promise<Snapshot> {
++        if (!this.snapshot) {
++            try {
++                this.snapshot = await this.takeSnapshot();
++            } catch (e) {
++                this.snapshot = { tasks: [], error: e instanceof Error ? e.message : String(e) };
++            }
++        }
++        return this.snapshot;
++    }
++
++    private summary(t: Task, snap: Snapshot): string {
++        const parts = [t.state];
++        if (t.priority !== undefined) {
++            parts.push(`prio ${t.priority}${t.basePriority !== undefined && t.basePriority !== t.priority ? ` (base ${t.basePriority})` : ''}`);
++        }
++        if (t.stackFree !== undefined) {
++            parts.push(`stack free ${t.stackFree} B`);
++        }
++        if (t.runTime !== undefined && snap.totalRunTime) {
++            parts.push(`cpu ${(100 * t.runTime / snap.totalRunTime).toFixed(1)}%`);
++        }
++        return parts.join(' · ');
++    }
++
++    public async variables(ref: number): Promise<DebugProtocol.Variable[]> {
++        const snap = await this.getSnapshot();
++        if (ref === RTOS_REF_ROOT) {
++            if (snap.error) {
++                return [{ name: 'error', value: snap.error, variablesReference: 0 }];
++            }
++            if (snap.tasks.length === 0) {
++                return [{ name: '(no tasks)', value: 'no tasks created yet or scheduler not started', variablesReference: 0 }];
++            }
++            const seen = new Map<string, number>();
++            return snap.tasks.map((t, i) => {
++                const n = (seen.get(t.name) ?? 0) + 1;
++                seen.set(t.name, n);
++                return {
++                    name: n > 1 ? `${t.name} (${n})` : t.name,
++                    value: this.summary(t, snap),
++                    type: `task @ ${hexAddr(t.tcb)}`,
++                    variablesReference: RTOS_REF_ROOT + 1 + i,
++                    memoryReference: hexAddr(t.tcb),
++                    presentationHint: { kind: 'class', attributes: ['readOnly'] }
++                };
++            });
++        }
++        const t = snap.tasks[ref - RTOS_REF_ROOT - 1];
++        if (!t) {
++            return [];
++        }
++        const v = (name: string, value: string, memoryReference?: number): DebugProtocol.Variable => ({
++            name, value, variablesReference: 0,
++            ...(memoryReference ? { memoryReference: hexAddr(memoryReference) } : {}),
++            presentationHint: { attributes: ['readOnly'] }
++        });
++        const out: DebugProtocol.Variable[] = [v('State', t.state)];
++        if (t.priority !== undefined) {
++            out.push(v('Priority', String(t.priority)));
++        }
++        if (t.basePriority !== undefined && t.basePriority !== t.priority) {
++            out.push(v('Base priority', `${t.basePriority} (inherited ${t.priority})`));
++        }
++        if (t.stackBase !== undefined) {
++            out.push(v('Stack start (pxStack)', hexAddr(t.stackBase), t.stackBase));
++        }
++        if (t.stackEnd !== undefined && t.stackBase !== undefined) {
++            out.push(v('Stack size', `${t.stackEnd + 4 - t.stackBase} B`));
++        }
++        if (t.stackTop !== undefined && t.state !== 'Running') {
++            out.push(v('Saved SP (pxTopOfStack)', hexAddr(t.stackTop), t.stackTop));
++            if (t.stackEnd !== undefined) {
++                out.push(v('Stack used now', `${t.stackEnd + 4 - t.stackTop} B`));
++            }
++        }
++        if (t.stackFree !== undefined) {
++            out.push(v('Stack free (high-water mark)', `${t.stackFree} B${t.stackFree === 0 ? '  ⚠ possible overflow' : ''}`));
++        }
++        if (t.runTime !== undefined) {
++            const pct = snap.totalRunTime ? `  (${(100 * t.runTime / snap.totalRunTime).toFixed(1)}%)` : '';
++            out.push(v('Run time', `${t.runTime}${pct}`));
++        }
++        if (t.tcbNumber !== undefined) {
++            out.push(v('TCB number', String(t.tcbNumber)));
++        }
++        out.push({
++            name: 'TCB', value: hexAddr(t.tcb), variablesReference: 0, memoryReference: hexAddr(t.tcb),
++            evaluateName: `*(${this.tcbType} *)${hexAddr(t.tcb)}`
++        });
++        return out;
++    }
++}
+-- 
+2.43.0
+
