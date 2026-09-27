@@ -1,0 +1,61 @@
+# Builds the Cortex-Debug adapter from upstream sources + patches/ and attaches it to
+# the GitHub release. The Zed extension downloads this asset (it must not bundle it).
+#
+# Usage: bump the version in extension.toml and Cargo.toml, commit, then
+#   git tag v0.4.0 && git push origin v0.4.0
+name: Release adapter
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Check that the tag matches extension.toml
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          want="$(sed -n 's/^version = "\(.*\)"/\1/p' extension.toml | head -1)"
+          test "v$want" = "${GITHUB_REF_NAME}" || { echo "Tag ${GITHUB_REF_NAME} != extension.toml version $want"; exit 1; }
+
+      - name: Build adapter
+        run: ./scripts/build-adapter.sh
+
+      - name: Package
+        run: cd adapter && zip -r ../cortex-debug-adapter.zip dist support LICENSE-cortex-debug
+
+      - name: Smoke test (adapter loads and answers DAP initialize)
+        run: |
+          node -e '
+            const { spawn } = require("child_process");
+            const p = spawn(process.execPath, ["adapter/dist/zedadapter.js"]);
+            const msg = JSON.stringify({ seq: 1, type: "request", command: "initialize", arguments: { adapterID: "cortex-debug", pathFormat: "path", linesStartAt1: true, columnsStartAt1: true } });
+            p.stdin.write(`Content-Length: ${Buffer.byteLength(msg)}\r\n\r\n${msg}`);
+            let out = "";
+            p.stdout.on("data", (d) => { out += d; if (out.includes("\"success\":true")) { console.log("ok"); p.kill(); process.exit(0); } });
+            setTimeout(() => { console.error(out); process.exit(1); }, 15000);
+          '
+
+      - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: cortex-debug-adapter.zip
+
+      - name: Upload artifact (manual runs)
+        if: "!startsWith(github.ref, 'refs/tags/')"
+        uses: actions/upload-artifact@v4
+        with:
+          name: cortex-debug-adapter
+          path: cortex-debug-adapter.zip

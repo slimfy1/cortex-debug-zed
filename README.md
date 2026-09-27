@@ -1,12 +1,10 @@
-# Cortex-Debug for Zed
+# Cortex-M Debugger for Zed
 
 Debug ARM Cortex-M microcontrollers in the [Zed](https://zed.dev) editor with
 the debug adapter from [Cortex-Debug](https://github.com/Marus/cortex-debug).
 It supports J-Link, OpenOCD, pyOCD, ST-Link, Black Magic Probe and QEMU.
 
-[Русская версия](README.ru.md)
-
-> **Status: experimental (v0.3.0).** End-to-end debug sessions have been
+> **Status: experimental (v0.4.0).** End-to-end debug sessions have been
 > tested on Linux against QEMU (Cortex-M3), including the SVD peripheral
 > view, the FreeRTOS task view and the memory view. It has not yet been tested on
 > real hardware or inside a running Zed instance on every platform. The
@@ -34,7 +32,7 @@ Cortex-Debug authors or with Zed Industries.
   read it with PuTTY (Raw), `telnet` or `nc`
 - Auto-detects `JLinkGDBServerCL.exe` in `C:\Program Files\SEGGER\JLink*`
 - Accepts almost all of your existing `launch.json` attributes from Cortex-Debug (the exceptions are listed under **Not supported yet**)
-- No downloads: the adapter is embedded in the extension and runs on the Node.js bundled with Zed
+- Nothing extra to install for the adapter: it is downloaded from this repository's GitHub releases on first use and runs on the Node.js bundled with Zed
 
 ### Not supported yet
 
@@ -58,17 +56,17 @@ Cortex-Debug UI features are missing:
 
 ## Installation
 
-The extension is not yet in the Zed extension registry, so install it as a
-dev extension:
+1. In Zed, open **Extensions** (`Ctrl+Shift+X` / `Cmd+Shift+X`), search for
+   **Cortex-M Debugger** and click **Install**.
+2. Create `.zed/debug.json` in your firmware project (see below).
+3. Start debugging with `F4` (**`debugger: start`**) and pick a configuration.
 
-1. Clone this repository:
-   ```sh
-   git clone https://github.com/<your-username>/zed-cortex-debug.git
-   ```
-2. In Zed, open the command palette (`Ctrl+Shift+P` / `Cmd+Shift+P`), run
-   **`zed: install dev extension`** and select the cloned folder.
-3. Create `.zed/debug.json` in your firmware project (see below).
-4. Start debugging with `F4` (**`debugger: start`**) and pick a configuration.
+On the first debug session the extension downloads the adapter
+(`cortex-debug-adapter.zip`, about 100 KB) from this repository's latest
+GitHub release.
+
+To try an unreleased version, clone this repository and run
+**`zed: install dev extension`** on the folder (see [Development](#development)).
 
 ## Configuration
 
@@ -252,19 +250,21 @@ implements partial `readMemory` responses (`unreadableBytes`), resolves the
 Memory View's address-bar expressions and attaches a `memoryReference` to
 variables and watch results.
 
-The Rust part ([`src/lib.rs`](src/lib.rs)) embeds the bundled adapter and
-unpacks it into the extension's work directory on first use. It then starts
-the adapter with Zed's Node.js. It also implements `dap_request_kind` and
+The Rust part ([`src/lib.rs`](src/lib.rs)) downloads the adapter from the
+latest GitHub release of this repository into the extension's work directory.
+It then starts the adapter with Zed's Node.js. If GitHub is unreachable, it
+uses the last downloaded version. It also implements `dap_request_kind` and
 `dap_config_to_scenario` for Zed's debugger.
 
 ### Repository layout
 
 ```
-adapter/                  bundled adapter (embedded into the wasm via include_str!)
+.github/workflows/        release.yml — builds the adapter and attaches it to each GitHub release
 debug_adapter_schemas/    JSON schema for debug.json, generated from Cortex-Debug's package.json
 examples/                 sample .zed/debug.json
 patches/                  patch against Cortex-Debug + BASE_COMMIT it applies to
-scripts/                  build-adapter.sh / build-adapter.ps1 — rebuild adapter/ from source
+scripts/                  build-adapter.sh / .ps1 — build the adapter into adapter/ (not committed)
+                          set-owner.sh / .ps1 — fill in your GitHub user name, name and email (re-runnable)
 src/lib.rs                the Zed extension (Rust → wasm32-wasip2)
 ```
 
@@ -283,22 +283,39 @@ src/lib.rs                the Zed extension (Rust → wasm32-wasip2)
 
 ## Development
 
-Rebuild the adapter from Cortex-Debug sources (requires git and Node.js 18+):
+Build the adapter from Cortex-Debug sources (requires git and Node.js 18+).
+The result goes to `adapter/`:
 
 ```sh
 ./scripts/build-adapter.sh          # Linux / macOS
 .\scripts\build-adapter.ps1         # Windows PowerShell
 ```
 
-Then click **Rebuild** on the extension in Zed's Extensions page.
-
-While you are working on the adapter itself, you can point Zed at your
-checkout instead of the embedded copy:
+Install the folder as a dev extension (**`zed: install dev extension`**; Zed
+needs [Rust via rustup](https://rustup.rs) for that). Then point it at your
+local adapter instead of the released one:
 
 ```jsonc
 // Zed settings.json
-"dap": { "cortex-debug": { "binary": "C:/src/cortex-debug" } }  // folder containing dist/zedadapter.js
+"dap": { "cortex-debug": { "binary": "C:/src/zed-cortex-debug/adapter" } }  // folder containing dist/zedadapter.js
 ```
+
+After changing `src/lib.rs`, click **Rebuild** on the extension in Zed's
+Extensions page. After changing the adapter, just start a new debug session.
+
+### Releasing
+
+1. Bump `version` in `extension.toml` and `Cargo.toml`, then commit.
+2. Tag and push:
+   ```sh
+   git tag v0.4.0
+   git push origin main v0.4.0
+   ```
+   The [release workflow](.github/workflows/release.yml) builds the adapter
+   and attaches `cortex-debug-adapter.zip` to the GitHub release.
+3. Update the version in the
+   [zed-industries/extensions](https://github.com/zed-industries/extensions)
+   registry (new submodule commit + `version` in `extensions.toml`) with a PR.
 
 ## Roadmap
 

@@ -1,7 +1,7 @@
 From e875786f5bc6abb8a720d80036582579014e1bb7 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 23 Sep 2026 23:47:27 +0300
-Subject: [PATCH 4/4] zed: FreeRTOS task view and Memory view support (0.3.0)
+Subject: [PATCH 4/5] zed: FreeRTOS task view and Memory view support (0.3.0)
 
 - src/zed/rtos.ts: walks FreeRTOS kernel lists via GDB expressions and
   shows tasks (state, priority, stack high-water mark, run time) as an

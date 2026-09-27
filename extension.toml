@@ -1,10 +1,10 @@
-id = "cortex-debug"
-name = "Cortex-Debug"
-description = "Debug ARM Cortex-M microcontrollers (J-Link, OpenOCD, pyOCD, ST-Link, BMP, QEMU) using the Cortex-Debug adapter."
-version = "0.3.0"
+id = "cortex-m-debugger"
+name = "Cortex-M Debugger"
+description = "Debug ARM Cortex-M microcontrollers with GDB (J-Link, OpenOCD, pyOCD, ST-Link, BMP, QEMU): SVD peripherals, FreeRTOS tasks, memory view. Based on the Cortex-Debug adapter."
+version = "0.4.0"
 schema_version = 1
-authors = ["<your-name> <<your-email>>"]
-repository = "https://github.com/<your-username>/zed-cortex-debug"
+authors = ["Andry <slimfy1@gmail.com>"]
+repository = "https://github.com/Andry/zed-cortex-debug"
 
 [debug_adapters.cortex-debug]
 schema_path = "debug_adapter_schemas/cortex-debug.json"

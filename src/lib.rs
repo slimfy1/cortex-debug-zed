@@ -1,9 +1,9 @@
 //! Zed extension that exposes the Cortex-Debug debug adapter.
 //!
 //! The adapter itself is the Node.js program from the Cortex-Debug project
-//! (built from `src/zed/adapter.ts`, see `patches/` and `scripts/`). It is
-//! embedded into this extension and unpacked into the extension's work
-//! directory on first use, so no download is required.
+//! (built from `src/zed/adapter.ts`, see `patches/` and `scripts/`). Following
+//! the Zed extension guidelines it is not bundled: CI attaches it to each GitHub
+//! release of this repository, and the extension downloads it on first use.
 
 use std::{
     env, fs,
@@ -14,91 +14,116 @@ use zed_extension_api::{
     self as zed,
     serde_json::{self, json, Map, Value},
     DebugAdapterBinary, DebugConfig, DebugRequest, DebugScenario, DebugTaskDefinition,
-    StartDebuggingRequestArguments, StartDebuggingRequestArgumentsRequest, Worktree,
+    DownloadedFileType, GithubReleaseOptions, StartDebuggingRequestArguments,
+    StartDebuggingRequestArgumentsRequest, Worktree,
 };
+
+/// GitHub repository whose releases carry the adapter (`owner/name`).
+const GITHUB_REPO: &str = "Andry/zed-cortex-debug";
+/// Release asset built by `.github/workflows/release.yml`.
+const ADAPTER_ASSET: &str = "cortex-debug-adapter.zip";
 
 const ADAPTER_NAME: &str = "cortex-debug";
 const INSTALL_DIR_PREFIX: &str = "cortex-debug-adapter-";
-
-/// Files of the adapter package, relative to the package root.
-const ADAPTER_FILES: &[(&str, &str)] = &[
-    (
-        "dist/zedadapter.js",
-        include_str!("../adapter/dist/zedadapter.js"),
-    ),
-    (
-        "support/gdbsupport.init",
-        include_str!("../adapter/support/gdbsupport.init"),
-    ),
-    (
-        "support/gdb-swo.init",
-        include_str!("../adapter/support/gdb-swo.init"),
-    ),
-    (
-        "LICENSE-cortex-debug",
-        include_str!("../adapter/LICENSE-cortex-debug"),
-    ),
-];
 const ADAPTER_ENTRY: &str = "dist/zedadapter.js";
 
 struct CortexDebugExtension {
-    /// Absolute path of the unpacked adapter package (once installed).
+    /// Absolute path of the installed adapter package (checked once per Zed session).
     installed: Option<PathBuf>,
 }
 
-/// 64-bit FNV-1a, used to give each embedded adapter build its own directory.
-fn fnv1a(data: &[&str]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for part in data {
-        for byte in part.as_bytes() {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-    }
-    hash
+fn abs_path(rel: &Path) -> Result<PathBuf, String> {
+    Ok(env::current_dir()
+        .map_err(|e| format!("cortex-debug: cannot determine work directory: {e}"))?
+        .join(rel))
+}
+
+/// Newest adapter already unpacked in the work directory (used when offline).
+fn newest_installed() -> Option<String> {
+    fs::read_dir(".")
+        .ok()?
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            (name.starts_with(INSTALL_DIR_PREFIX) && Path::new(&name).join(ADAPTER_ENTRY).exists())
+                .then_some(name)
+        })
+        .max_by(|a, b| version_key(a).cmp(&version_key(b)))
+}
+
+fn version_key(dir: &str) -> Vec<u64> {
+    dir.trim_start_matches(INSTALL_DIR_PREFIX)
+        .trim_start_matches('v')
+        .split(|c: char| !c.is_ascii_digit())
+        .filter_map(|p| p.parse().ok())
+        .collect()
 }
 
 impl CortexDebugExtension {
-    /// Unpacks the embedded adapter into the extension work directory (once per build).
-    fn install_embedded_adapter(&mut self) -> Result<PathBuf, String> {
+    /// Makes sure the adapter from the latest GitHub release is unpacked in the
+    /// extension work directory and returns its absolute path.
+    fn install_adapter(&mut self) -> Result<PathBuf, String> {
         if let Some(path) = &self.installed {
-            return Ok(path.clone());
+            if path.join(ADAPTER_ENTRY).exists() {
+                return Ok(path.clone());
+            }
         }
 
-        let contents: Vec<&str> = ADAPTER_FILES.iter().map(|(_, c)| *c).collect();
-        let dir_name = format!("{INSTALL_DIR_PREFIX}{:016x}", fnv1a(&contents));
-        let dir = Path::new(&dir_name);
+        let release = zed::latest_github_release(
+            GITHUB_REPO,
+            GithubReleaseOptions {
+                require_assets: true,
+                pre_release: false,
+            },
+        );
 
-        if !dir.join(ADAPTER_ENTRY).exists() {
-            // Remove adapters unpacked by older versions of this extension.
-            if let Ok(entries) = fs::read_dir(".") {
-                for entry in entries.flatten() {
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    if name.starts_with(INSTALL_DIR_PREFIX) && name != dir_name {
-                        fs::remove_dir_all(entry.path()).ok();
+        let dir_name = match release {
+            Ok(release) => {
+                let dir_name = format!("{INSTALL_DIR_PREFIX}{}", release.version);
+                if !Path::new(&dir_name).join(ADAPTER_ENTRY).exists() {
+                    let asset = release
+                        .assets
+                        .iter()
+                        .find(|a| a.name == ADAPTER_ASSET)
+                        .ok_or_else(|| {
+                            format!(
+                                "cortex-debug: release {} of {GITHUB_REPO} has no {ADAPTER_ASSET}",
+                                release.version
+                            )
+                        })?;
+                    fs::remove_dir_all(&dir_name).ok();
+                    zed::download_file(&asset.download_url, &dir_name, DownloadedFileType::Zip)
+                        .map_err(|e| format!("cortex-debug: failed to download the adapter: {e}"))?;
+                    if !Path::new(&dir_name).join(ADAPTER_ENTRY).exists() {
+                        return Err(format!(
+                            "cortex-debug: downloaded {ADAPTER_ASSET} does not contain {ADAPTER_ENTRY}"
+                        ));
+                    }
+                    // Remove adapters from older releases.
+                    if let Ok(entries) = fs::read_dir(".") {
+                        for entry in entries.flatten() {
+                            let name = entry.file_name().to_string_lossy().into_owned();
+                            if name.starts_with(INSTALL_DIR_PREFIX) && name != dir_name {
+                                fs::remove_dir_all(entry.path()).ok();
+                            }
+                        }
                     }
                 }
+                dir_name
             }
-            for (rel, content) in ADAPTER_FILES {
-                let target = dir.join(rel);
-                if let Some(parent) = target.parent() {
-                    fs::create_dir_all(parent)
-                        .map_err(|e| format!("cortex-debug: cannot create {parent:?}: {e}"))?;
-                }
-                fs::write(&target, content)
-                    .map_err(|e| format!("cortex-debug: cannot write {target:?}: {e}"))?;
-            }
-        }
+            // Offline or GitHub rate limit: fall back to whatever we installed before.
+            Err(e) => newest_installed().ok_or_else(|| {
+                format!("cortex-debug: cannot fetch the adapter from github.com/{GITHUB_REPO}: {e}")
+            })?,
+        };
 
-        let abs = env::current_dir()
-            .map_err(|e| format!("cortex-debug: cannot determine work directory: {e}"))?
-            .join(dir);
+        let abs = abs_path(Path::new(&dir_name))?;
         self.installed = Some(abs.clone());
         Ok(abs)
     }
 
     /// Path of the adapter's JS entry point: a user override from Zed settings
-    /// (`"dap": { "cortex-debug": { "binary": "..." } }`), or the embedded copy.
+    /// (`"dap": { "cortex-debug": { "binary": "..." } }`), or the downloaded copy.
     fn adapter_entry(&mut self, user_path: Option<String>) -> Result<String, String> {
         if let Some(user_path) = user_path {
             let p = PathBuf::from(&user_path);
@@ -109,7 +134,7 @@ impl CortexDebugExtension {
             let entry = if is_js { p } else { p.join(ADAPTER_ENTRY) };
             return Ok(entry.to_string_lossy().into_owned());
         }
-        let root = self.install_embedded_adapter()?;
+        let root = self.install_adapter()?;
         Ok(root.join(ADAPTER_ENTRY).to_string_lossy().into_owned())
     }
 

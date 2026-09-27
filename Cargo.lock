@@ -39,6 +39,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
+name = "cortex_m_debugger"
+version = "0.4.0"
+dependencies = [
+ "zed_extension_api",
+]
+
+[[package]]
 name = "crc32fast"
 version = "1.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -749,13 +756,6 @@ dependencies = [
  "quote",
  "syn 3.0.6",
  "synstructure",
-]
-
-[[package]]
-name = "zed_cortex_debug"
-version = "0.3.0"
-dependencies = [
- "zed_extension_api",
 ]
 
 [[package]]
