@@ -1,7 +1,7 @@
 id = "cortex-m-debugger"
 name = "Cortex-M Debugger"
 description = "Debug ARM Cortex-M microcontrollers with GDB (J-Link, OpenOCD, pyOCD, ST-Link, BMP, QEMU): SVD peripherals, FreeRTOS tasks, memory view. Based on the Cortex-Debug adapter."
-version = "0.4.1"
+version = "0.4.2"
 schema_version = 1
 authors = ["Andry <slimfy1@gmail.com>"]
 repository = "https://github.com/slimfy1/zed-cortex-debug"
