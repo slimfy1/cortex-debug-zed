@@ -19,7 +19,7 @@ use zed_extension_api::{
 };
 
 /// GitHub repository whose releases carry the adapter (`owner/name`).
-const GITHUB_REPO: &str = "Andry/zed-cortex-debug";
+const GITHUB_REPO: &str = "slimfy1/cortex-debug-zed";
 /// Release asset built by `.github/workflows/release.yml`.
 const ADAPTER_ASSET: &str = "cortex-debug-adapter.zip";
 
