@@ -30,7 +30,7 @@ jobs:
           test "v$want" = "${GITHUB_REF_NAME}" || { echo "Tag ${GITHUB_REF_NAME} != extension.toml version $want"; exit 1; }
 
       - name: Build adapter
-        run: ./scripts/build-adapter.sh
+        run: bash ./scripts/build-adapter.sh
 
       - name: Package
         run: cd adapter && zip -r ../cortex-debug-adapter.zip dist support LICENSE-cortex-debug

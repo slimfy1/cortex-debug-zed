@@ -93,7 +93,9 @@ impl CortexDebugExtension {
                         })?;
                     fs::remove_dir_all(&dir_name).ok();
                     zed::download_file(&asset.download_url, &dir_name, DownloadedFileType::Zip)
-                        .map_err(|e| format!("cortex-debug: failed to download the adapter: {e}"))?;
+                        .map_err(|e| {
+                            format!("cortex-debug: failed to download the adapter: {e}")
+                        })?;
                     if !Path::new(&dir_name).join(ADAPTER_ENTRY).exists() {
                         return Err(format!(
                             "cortex-debug: downloaded {ADAPTER_ASSET} does not contain {ADAPTER_ENTRY}"
@@ -127,13 +129,25 @@ impl CortexDebugExtension {
     fn adapter_entry(&mut self, user_path: Option<String>) -> Result<String, String> {
         if let Some(user_path) = user_path {
             let p = PathBuf::from(&user_path);
-            let is_js = p
-                .extension()
-                .map(|e| e.eq_ignore_ascii_case("js"))
-                .unwrap_or(false);
-            let entry = if is_js { p } else { p.join(ADAPTER_ENTRY) };
+            let entry = if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("js")) {
+                p
+            } else {
+                p.join(ADAPTER_ENTRY)
+            };
+
             return Ok(entry.to_string_lossy().into_owned());
         }
+
+        // Локальная разработка: путь к собранному JS-адаптеру
+        #[cfg(debug_assertions)]
+        {
+            let local = PathBuf::from("C:/Projects/cortex-debug-zed/adapter/dist/zedadapter.js");
+
+            if local.is_file() {
+                return Ok(local.to_string_lossy().into_owned());
+            }
+        }
+
         let root = self.install_adapter()?;
         Ok(root.join(ADAPTER_ENTRY).to_string_lossy().into_owned())
     }
